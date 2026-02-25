@@ -1,14 +1,85 @@
 import os
+import re
 import tempfile
 from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+import psycopg2
+from fastapi import FastAPI, File, Request, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, Response
+
 from openai import OpenAI
 
 app = FastAPI()
 
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB (Whisper API limit)
+
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
+
+def get_db():
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        return None
+    return psycopg2.connect(url)
+
+
+def init_db():
+    conn = get_db()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS transcriptions (
+                    id          SERIAL PRIMARY KEY,
+                    filename    TEXT NOT NULL,
+                    file_size   INTEGER NOT NULL,
+                    duration_s  REAL,
+                    vtt_content TEXT NOT NULL,
+                    created_at  TIMESTAMP DEFAULT NOW(),
+                    ip_address  TEXT
+                );
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def parse_vtt_duration(vtt_text: str) -> float | None:
+    """Extract duration from the last timestamp in VTT content."""
+    matches = re.findall(r"(\d{2}):(\d{2}):(\d{2})\.(\d{3})", vtt_text)
+    if not matches:
+        return None
+    h, m, s, ms = matches[-1]
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+
+
+def save_transcription(filename: str, file_size: int, vtt_content: str, ip: str | None):
+    conn = get_db()
+    if conn is None:
+        return
+    try:
+        duration = parse_vtt_duration(vtt_content)
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO transcriptions (filename, file_size, duration_s, vtt_content, ip_address)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (filename, file_size, duration, vtt_content, ip),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+
+# ---------------------------------------------------------------------------
+# HTML pages
+# ---------------------------------------------------------------------------
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -34,6 +105,9 @@ HTML_PAGE = """
   .status { margin-top: 1rem; font-size: 0.9rem; text-align: center; }
   .status.error { color: #ff6b6b; }
   .status.success a { color: #4a9eff; text-decoration: none; font-weight: 600; }
+  .nav { margin-top: 1.5rem; text-align: center; }
+  .nav a { color: #888; font-size: 0.85rem; text-decoration: none; }
+  .nav a:hover { color: #4a9eff; }
 </style>
 </head>
 <body>
@@ -49,6 +123,7 @@ HTML_PAGE = """
     <button type="submit" id="submit-btn" disabled>Generate VTT</button>
   </form>
   <div class="status" id="status"></div>
+  <div class="nav"><a href="/history">View transcription history</a></div>
 </div>
 <script>
   const form = document.getElementById('form');
@@ -104,6 +179,42 @@ HTML_PAGE = """
 </html>
 """
 
+HISTORY_PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Transcription History</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #0f0f0f; color: #e0e0e0; display: flex; justify-content: center; padding: 2rem; }
+  .container { background: #1a1a1a; border-radius: 12px; padding: 2.5rem; max-width: 720px; width: 100%; box-shadow: 0 4px 24px rgba(0,0,0,0.4); }
+  h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+  .nav { margin-bottom: 1.5rem; }
+  .nav a { color: #4a9eff; font-size: 0.85rem; text-decoration: none; }
+  .nav a:hover { text-decoration: underline; }
+  table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+  th, td { text-align: left; padding: 0.6rem 0.75rem; border-bottom: 1px solid #2a2a2a; font-size: 0.9rem; }
+  th { color: #888; font-weight: 600; }
+  td a { color: #4a9eff; text-decoration: none; }
+  td a:hover { text-decoration: underline; }
+  .empty { color: #666; margin-top: 1.5rem; text-align: center; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="nav"><a href="/">&larr; Back to generator</a></div>
+  <h1>Transcription History</h1>
+  {{TABLE}}
+</div>
+</body>
+</html>
+"""
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -111,7 +222,7 @@ async def index():
 
 
 @app.post("/transcribe")
-async def transcribe(file: UploadFile = File(...)):
+async def transcribe(request: Request, file: UploadFile = File(...)):
     contents = await file.read()
     if len(contents) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File exceeds 25 MB limit.")
@@ -130,6 +241,11 @@ async def transcribe(file: UploadFile = File(...)):
                 response_format="vtt",
             )
 
+        # Save to database
+        ip = request.client.host if request.client else None
+        original_name = file.filename or "unknown"
+        save_transcription(original_name, len(contents), vtt_text, ip)
+
         out_name = Path(file.filename).stem + ".vtt" if file.filename else "subtitles.vtt"
         return Response(
             content=vtt_text,
@@ -138,3 +254,77 @@ async def transcribe(file: UploadFile = File(...)):
         )
     finally:
         os.unlink(tmp.name)
+
+
+@app.get("/history", response_class=HTMLResponse)
+async def history():
+    conn = get_db()
+    if conn is None:
+        html = HISTORY_PAGE.replace("{{TABLE}}", '<p class="empty">Database not configured.</p>')
+        return html
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, filename, file_size, duration_s, created_at FROM transcriptions ORDER BY created_at DESC LIMIT 100"
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        html = HISTORY_PAGE.replace("{{TABLE}}", '<p class="empty">No transcriptions yet.</p>')
+        return html
+
+    table_rows = ""
+    for row in rows:
+        tid, fname, fsize, dur, created = row
+        size_mb = f"{fsize / 1024 / 1024:.1f} MB"
+        duration = f"{dur:.0f}s" if dur else "—"
+        date = created.strftime("%Y-%m-%d %H:%M") if created else "—"
+        table_rows += (
+            f"<tr>"
+            f"<td>{fname}</td>"
+            f"<td>{size_mb}</td>"
+            f"<td>{duration}</td>"
+            f"<td>{date}</td>"
+            f'<td><a href="/download/{tid}">Download</a></td>'
+            f"</tr>\n"
+        )
+
+    table_html = (
+        "<table><thead><tr>"
+        "<th>Filename</th><th>Size</th><th>Duration</th><th>Date</th><th></th>"
+        "</tr></thead><tbody>\n"
+        + table_rows
+        + "</tbody></table>"
+    )
+    return HISTORY_PAGE.replace("{{TABLE}}", table_html)
+
+
+@app.get("/download/{transcription_id}")
+async def download(transcription_id: int):
+    conn = get_db()
+    if conn is None:
+        raise HTTPException(status_code=503, detail="Database not configured.")
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT filename, vtt_content FROM transcriptions WHERE id = %s",
+                (transcription_id,),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Transcription not found.")
+
+    fname, vtt = row
+    out_name = Path(fname).stem + ".vtt"
+    return Response(
+        content=vtt,
+        media_type="text/vtt",
+        headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
+    )
