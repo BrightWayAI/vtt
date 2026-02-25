@@ -6,12 +6,14 @@ from pathlib import Path
 import psycopg2
 from fastapi import FastAPI, File, Request, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, Response
+from pydub import AudioSegment
 
 from openai import OpenAI
 
 app = FastAPI()
 
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB (Whisper API limit)
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
+CHUNK_DURATION_MS = 10 * 60 * 1000  # 10 minutes per chunk
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -64,37 +66,43 @@ def fmt_ts(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
-def build_word_highlight_vtt(result) -> str:
+def transcribe_chunk(client: OpenAI, chunk_path: str):
+    """Transcribe a single audio chunk via Whisper and return the result."""
+    with open(chunk_path, "rb") as f:
+        return client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f,
+            response_format="verbose_json",
+            timestamp_granularities=["word", "segment"],
+        )
+
+
+def build_word_highlight_vtt(all_words, all_segments) -> str:
     """Build a WebVTT file with per-word highlight cues.
 
     Each word gets its own cue showing the full segment text with the
     active word wrapped in <v>...</v> tags.
     """
-    words = getattr(result, "words", None) or []
-    segments = getattr(result, "segments", None) or []
-
-    if not words:
-        # Fallback: plain single-cue VTT
-        return f"WEBVTT\nKind: captions\nLanguage: en\n\n00:00:00.000 --> 00:00:01.000\n{result.text}\n"
+    if not all_words:
+        return "WEBVTT\nKind: captions\nLanguage: en\n\n"
 
     lines = ["WEBVTT", "Kind: captions", "Language: en", ""]
 
-    # Assign words to segments by time overlap
-    for seg in segments:
+    for seg in all_segments:
         seg_words = [
-            w for w in words
-            if w.start >= seg.start - 0.01 and w.end <= seg.end + 0.01
+            w for w in all_words
+            if w["start"] >= seg["start"] - 0.01 and w["end"] <= seg["end"] + 0.01
         ]
         if not seg_words:
             continue
 
         for i, word in enumerate(seg_words):
-            start = fmt_ts(word.start)
-            end = fmt_ts(word.end)
+            start = fmt_ts(word["start"])
+            end = fmt_ts(word["end"])
 
             parts = []
             for j, w in enumerate(seg_words):
-                txt = w.word.strip()
+                txt = w["word"].strip()
                 if j == i:
                     parts.append(f"<v>{txt}</v>")
                 else:
@@ -105,6 +113,60 @@ def build_word_highlight_vtt(result) -> str:
             lines.append("")
 
     return "\n".join(lines)
+
+
+def transcribe_file(file_path: str) -> str:
+    """Transcribe an audio/video file, splitting into chunks if needed.
+
+    Returns the complete WebVTT string.
+    """
+    client = OpenAI()
+    audio = AudioSegment.from_file(file_path)
+    duration_ms = len(audio)
+
+    # If short enough, send directly without splitting
+    if duration_ms <= CHUNK_DURATION_MS:
+        # Export as mp3 to keep under 25MB for Whisper
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            audio.export(tmp.name, format="mp3", bitrate="64k")
+            result = transcribe_chunk(client, tmp.name)
+            os.unlink(tmp.name)
+
+        words = [{"word": w.word, "start": w.start, "end": w.end}
+                 for w in (getattr(result, "words", None) or [])]
+        segments = [{"start": s.start, "end": s.end, "text": s.text}
+                    for s in (getattr(result, "segments", None) or [])]
+        return build_word_highlight_vtt(words, segments)
+
+    # Split into chunks
+    all_words = []
+    all_segments = []
+
+    for chunk_start_ms in range(0, duration_ms, CHUNK_DURATION_MS):
+        chunk_end_ms = min(chunk_start_ms + CHUNK_DURATION_MS, duration_ms)
+        chunk = audio[chunk_start_ms:chunk_end_ms]
+        offset_s = chunk_start_ms / 1000.0
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            chunk.export(tmp.name, format="mp3", bitrate="64k")
+            result = transcribe_chunk(client, tmp.name)
+            os.unlink(tmp.name)
+
+        for w in getattr(result, "words", None) or []:
+            all_words.append({
+                "word": w.word,
+                "start": w.start + offset_s,
+                "end": w.end + offset_s,
+            })
+
+        for s in getattr(result, "segments", None) or []:
+            all_segments.append({
+                "start": s.start + offset_s,
+                "end": s.end + offset_s,
+                "text": s.text,
+            })
+
+    return build_word_highlight_vtt(all_words, all_segments)
 
 
 def save_transcription(filename: str, file_size: int, vtt_content: str, ip: str | None):
@@ -149,6 +211,7 @@ HTML_PAGE = """
   label.file-label { display: block; border: 2px dashed #333; border-radius: 8px; padding: 2rem; text-align: center; cursor: pointer; transition: border-color 0.2s; margin-bottom: 1rem; }
   label.file-label:hover { border-color: #555; }
   label.file-label.has-file { border-color: #4a9eff; }
+  label.file-label.dragover { border-color: #4a9eff; background: rgba(74,158,255,0.05); }
   input[type="file"] { display: none; }
   .file-name { font-size: 0.85rem; color: #4a9eff; margin-top: 0.5rem; word-break: break-all; }
   button { width: 100%; padding: 0.75rem; border: none; border-radius: 8px; background: #4a9eff; color: #fff; font-size: 1rem; cursor: pointer; transition: background 0.2s; }
@@ -167,7 +230,7 @@ HTML_PAGE = """
   <h1>VTT Generator</h1>
   <p class="sub">Upload a video or audio file to generate subtitles (.vtt)</p>
   <form id="form">
-    <label class="file-label" id="drop-label">
+    <label class="file-label" id="drop-label" for="file-input">
       <span id="label-text">Click to select or drag a file here</span>
       <div class="file-name" id="file-name"></div>
       <input type="file" id="file-input" accept="video/*,audio/*,.mp3,.mp4,.m4a,.wav,.webm,.ogg,.flac,.mpeg,.mpga">
@@ -180,32 +243,54 @@ HTML_PAGE = """
 <script>
   const form = document.getElementById('form');
   const fileInput = document.getElementById('file-input');
-  const fileName = document.getElementById('file-name');
+  const fileNameEl = document.getElementById('file-name');
   const label = document.getElementById('drop-label');
   const btn = document.getElementById('submit-btn');
   const status = document.getElementById('status');
 
+  function setFile(file) {
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    fileInput.files = dt.files;
+    fileNameEl.textContent = file.name + ' (' + (file.size / 1024 / 1024).toFixed(1) + ' MB)';
+    label.classList.add('has-file');
+    btn.disabled = false;
+  }
+
   fileInput.addEventListener('change', () => {
-    if (fileInput.files.length) {
-      const f = fileInput.files[0];
-      fileName.textContent = f.name + ' (' + (f.size / 1024 / 1024).toFixed(1) + ' MB)';
-      label.classList.add('has-file');
-      btn.disabled = false;
-    }
+    if (fileInput.files.length) setFile(fileInput.files[0]);
+  });
+
+  // Drag and drop
+  label.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    label.classList.add('dragover');
+  });
+  label.addEventListener('dragleave', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    label.classList.remove('dragover');
+  });
+  label.addEventListener('drop', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    label.classList.remove('dragover');
+    if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
   });
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const file = fileInput.files[0];
     if (!file) return;
-    if (file.size > 25 * 1024 * 1024) {
+    if (file.size > 500 * 1024 * 1024) {
       status.className = 'status error';
-      status.textContent = 'File exceeds 25 MB limit.';
+      status.textContent = 'File exceeds 500 MB limit.';
       return;
     }
     btn.disabled = true;
     status.className = 'status';
-    status.textContent = 'Transcribing… this may take a minute.';
+    status.textContent = 'Transcribing… this may take a few minutes for large files.';
     try {
       const fd = new FormData();
       fd.append('file', file);
@@ -277,7 +362,7 @@ async def index():
 async def transcribe(request: Request, file: UploadFile = File(...)):
     contents = await file.read()
     if len(contents) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File exceeds 25 MB limit.")
+        raise HTTPException(status_code=413, detail="File exceeds 500 MB limit.")
 
     suffix = Path(file.filename).suffix if file.filename else ".mp4"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
@@ -285,16 +370,7 @@ async def transcribe(request: Request, file: UploadFile = File(...)):
         tmp.write(contents)
         tmp.close()
 
-        client = OpenAI()
-        with open(tmp.name, "rb") as audio_file:
-            result = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="verbose_json",
-                timestamp_granularities=["word", "segment"],
-            )
-
-        vtt_text = build_word_highlight_vtt(result)
+        vtt_text = transcribe_file(tmp.name)
 
         # Save to database
         ip = request.client.host if request.client else None
