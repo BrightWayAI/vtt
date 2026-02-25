@@ -4,3 +4,4 @@ python-multipart
 openai
 psycopg2-binary
 pydub
+httpx
