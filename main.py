@@ -55,6 +55,58 @@ def parse_vtt_duration(vtt_text: str) -> float | None:
     return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
 
 
+def fmt_ts(seconds: float) -> str:
+    """Format seconds as HH:MM:SS.mmm"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int(round((seconds % 1) * 1000))
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def build_word_highlight_vtt(result) -> str:
+    """Build a WebVTT file with per-word highlight cues.
+
+    Each word gets its own cue showing the full segment text with the
+    active word wrapped in <v>...</v> tags.
+    """
+    words = getattr(result, "words", None) or []
+    segments = getattr(result, "segments", None) or []
+
+    if not words:
+        # Fallback: plain single-cue VTT
+        return f"WEBVTT\nKind: captions\nLanguage: en\n\n00:00:00.000 --> 00:00:01.000\n{result.text}\n"
+
+    lines = ["WEBVTT", "Kind: captions", "Language: en", ""]
+
+    # Assign words to segments by time overlap
+    for seg in segments:
+        seg_words = [
+            w for w in words
+            if w.start >= seg.start - 0.01 and w.end <= seg.end + 0.01
+        ]
+        if not seg_words:
+            continue
+
+        for i, word in enumerate(seg_words):
+            start = fmt_ts(word.start)
+            end = fmt_ts(word.end)
+
+            parts = []
+            for j, w in enumerate(seg_words):
+                txt = w.word.strip()
+                if j == i:
+                    parts.append(f"<v>{txt}</v>")
+                else:
+                    parts.append(txt)
+
+            lines.append(f"{start} --> {end}")
+            lines.append(" ".join(parts))
+            lines.append("")
+
+    return "\n".join(lines)
+
+
 def save_transcription(filename: str, file_size: int, vtt_content: str, ip: str | None):
     conn = get_db()
     if conn is None:
@@ -235,11 +287,14 @@ async def transcribe(request: Request, file: UploadFile = File(...)):
 
         client = OpenAI()
         with open(tmp.name, "rb") as audio_file:
-            vtt_text = client.audio.transcriptions.create(
+            result = client.audio.transcriptions.create(
                 model="whisper-1",
                 file=audio_file,
-                response_format="vtt",
+                response_format="verbose_json",
+                timestamp_granularities=["word", "segment"],
             )
+
+        vtt_text = build_word_highlight_vtt(result)
 
         # Save to database
         ip = request.client.host if request.client else None
