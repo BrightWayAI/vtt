@@ -185,16 +185,51 @@ def transcribe_file(file_path: str) -> str:
     return build_word_highlight_vtt(all_words, all_segments)
 
 
+CONTENT_TYPE_SUFFIX = {
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/x-msvideo": ".avi",
+    "video/webm": ".webm",
+    "video/x-matroska": ".mkv",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/wav": ".wav",
+    "audio/ogg": ".ogg",
+    "audio/webm": ".webm",
+    "audio/flac": ".flac",
+    "audio/x-flac": ".flac",
+}
+
+
 def download_url_to_temp(url: str) -> tuple[str, str, int]:
     """Download a URL to a temp file. Returns (path, filename, size)."""
-    parsed = urlparse(url)
-    filename = Path(unquote(parsed.path)).name or "download.mp4"
-    suffix = Path(filename).suffix or ".mp4"
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp = None
     size = 0
     with httpx.stream("GET", url, follow_redirects=True, timeout=300) as r:
         r.raise_for_status()
+
+        # Determine filename: prefer Content-Disposition, then final URL path
+        content_disposition = r.headers.get("content-disposition", "")
+        filename = None
+        if content_disposition:
+            import re
+            m = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';]+)', content_disposition, re.IGNORECASE)
+            if m:
+                filename = unquote(m.group(1).strip())
+
+        if not filename:
+            final_url = str(r.url)
+            parsed_final = urlparse(final_url)
+            filename = Path(unquote(parsed_final.path)).name or "download"
+
+        # Determine suffix: prefer filename extension, then Content-Type
+        suffix = Path(filename).suffix
+        if not suffix:
+            content_type = r.headers.get("content-type", "").split(";")[0].strip()
+            suffix = CONTENT_TYPE_SUFFIX.get(content_type, ".mp4")
+            filename = filename + suffix
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         for chunk in r.iter_bytes(chunk_size=1024 * 64):
             tmp.write(chunk)
             size += len(chunk)
