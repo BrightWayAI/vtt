@@ -5,3 +5,5 @@ openai
 psycopg2-binary
 pydub
 httpx
+gspread
+google-auth

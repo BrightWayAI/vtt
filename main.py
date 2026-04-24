@@ -30,7 +30,9 @@ VIDEOS_UPLOAD_DIR = Path(os.path.expanduser(
     os.environ.get("VIDEOS_UPLOAD_DIR", "~/Desktop/Videos for Upload")
 ))
 
-SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+UPLOAD_SHEET_ID = "1OUQ0NyIaCOsPvYUCQhJ41roINv9fT9wrV4llHl74BpY"
+UPLOAD_SHEET_TAB = "Information for Video Uploading"
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -385,20 +387,24 @@ def _write_upload_csv_fallback(row: dict) -> None:
 
 
 def write_to_upload_sheet(row: dict) -> None:
-    """Append the row to the Google Sheet via Apps Script webhook; falls back to local CSV."""
-    payload = {col: row.get(col, "") for col in _UPLOAD_CSV_COLS}
-    if not SHEETS_WEBHOOK_URL:
-        _write_upload_csv_fallback(payload)
+    """Append the row to the Google Sheet via service account; falls back to local CSV."""
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    values = [row.get(col, "") for col in _UPLOAD_CSV_COLS]
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        _write_upload_csv_fallback(row)
         return
     try:
-        with httpx.Client(follow_redirects=True, timeout=30) as client:
-            resp = client.post(SHEETS_WEBHOOK_URL, json=payload)
-            resp.raise_for_status()
-            result = resp.json()
-            if result.get("status") != "ok":
-                raise ValueError(result.get("message", "unknown error"))
+        creds = Credentials.from_service_account_file(
+            GOOGLE_SERVICE_ACCOUNT_JSON,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+        gc = gspread.authorize(creds)
+        ws = gc.open_by_key(UPLOAD_SHEET_ID).worksheet(UPLOAD_SHEET_TAB)
+        ws.append_row(values, value_input_option="USER_ENTERED")
     except Exception:
-        _write_upload_csv_fallback(payload)
+        _write_upload_csv_fallback(row)
 
 
 # ---------------------------------------------------------------------------
