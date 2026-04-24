@@ -397,13 +397,20 @@ def write_to_upload_sheet(row: dict) -> None:
         _write_upload_csv_fallback(row)
         return
     try:
-        creds = Credentials.from_authorized_user_file(
-            GOOGLE_OAUTH_TOKEN,
-            scopes=["https://www.googleapis.com/auth/spreadsheets"],
-        )
+        # Env var can be raw JSON (Railway) or a file path (local)
+        if GOOGLE_OAUTH_TOKEN.strip().startswith("{"):
+            info = json.loads(GOOGLE_OAUTH_TOKEN)
+            creds = Credentials.from_authorized_user_info(
+                info,
+                scopes=["https://www.googleapis.com/auth/spreadsheets"],
+            )
+        else:
+            creds = Credentials.from_authorized_user_file(
+                GOOGLE_OAUTH_TOKEN,
+                scopes=["https://www.googleapis.com/auth/spreadsheets"],
+            )
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            Path(GOOGLE_OAUTH_TOKEN).write_text(creds.to_json())
         gc = gspread.authorize(creds)
         ws = gc.open_by_key(UPLOAD_SHEET_ID).worksheet(UPLOAD_SHEET_TAB)
         ws.append_row(values, value_input_option="USER_ENTERED")
