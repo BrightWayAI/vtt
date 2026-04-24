@@ -30,6 +30,8 @@ VIDEOS_UPLOAD_DIR = Path(os.path.expanduser(
     os.environ.get("VIDEOS_UPLOAD_DIR", "~/Desktop/Videos for Upload")
 ))
 
+SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "")
+
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
@@ -366,8 +368,8 @@ def sel_check_and_rewrite(row: dict) -> dict:
     return row
 
 
-def write_upload_csv(row: dict) -> None:
-    """Append a 14-column upload row to the daily CSV in the Videos for Upload folder."""
+def _write_upload_csv_fallback(row: dict) -> None:
+    """Fallback: append row to a local CSV when the Sheets webhook is unavailable."""
     if not VIDEOS_UPLOAD_DIR.is_dir():
         return
     csv_path = VIDEOS_UPLOAD_DIR / f"video-upload-rows-{date.today().isoformat()}.csv"
@@ -380,6 +382,23 @@ def write_upload_csv(row: dict) -> None:
             writer.writerow({col: row.get(col, "") for col in _UPLOAD_CSV_COLS})
     except Exception:
         pass
+
+
+def write_to_upload_sheet(row: dict) -> None:
+    """Append the row to the Google Sheet via Apps Script webhook; falls back to local CSV."""
+    payload = {col: row.get(col, "") for col in _UPLOAD_CSV_COLS}
+    if not SHEETS_WEBHOOK_URL:
+        _write_upload_csv_fallback(payload)
+        return
+    try:
+        with httpx.Client(follow_redirects=True, timeout=30) as client:
+            resp = client.post(SHEETS_WEBHOOK_URL, json=payload)
+            resp.raise_for_status()
+            result = resp.json()
+            if result.get("status") != "ok":
+                raise ValueError(result.get("message", "unknown error"))
+    except Exception:
+        _write_upload_csv_fallback(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -891,7 +910,7 @@ async def transcribe(request: Request, file: UploadFile = File(...)):
         master_row = fetch_master_sheet_row(video_id) if video_id is not None else None
         if master_row:
             master_row = sel_check_and_rewrite(master_row)
-            write_upload_csv(master_row)
+            write_to_upload_sheet(master_row)
 
         out_name = stem + ".vtt"
         return Response(
@@ -929,7 +948,7 @@ async def transcribe_url(request: Request, url: str = Form(...)):
         master_row = fetch_master_sheet_row(video_id) if video_id is not None else None
         if master_row:
             master_row = sel_check_and_rewrite(master_row)
-            write_upload_csv(master_row)
+            write_to_upload_sheet(master_row)
 
         out_name = stem + ".vtt"
         return Response(
@@ -981,7 +1000,7 @@ async def batch(request: Request, urls: str):
                 b_master = fetch_master_sheet_row(vid) if vid is not None else None
                 if b_master:
                     b_master = sel_check_and_rewrite(b_master)
-                    write_upload_csv(b_master)
+                    write_to_upload_sheet(b_master)
                 yield f"data: {json.dumps({'index': i, 'status': 'done', 'id': tid})}\n\n"
             except Exception as exc:
                 yield f"data: {json.dumps({'index': i, 'status': 'error', 'message': f'Transcription failed: {exc}'})}\n\n"
