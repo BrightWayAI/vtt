@@ -7,3 +7,4 @@ pydub
 httpx
 gspread
 google-auth
+google-auth-oauthlib

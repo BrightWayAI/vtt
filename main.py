@@ -30,7 +30,7 @@ VIDEOS_UPLOAD_DIR = Path(os.path.expanduser(
     os.environ.get("VIDEOS_UPLOAD_DIR", "~/Desktop/Videos for Upload")
 ))
 
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+GOOGLE_OAUTH_TOKEN = os.environ.get("GOOGLE_OAUTH_TOKEN", "")
 UPLOAD_SHEET_ID = "1OUQ0NyIaCOsPvYUCQhJ41roINv9fT9wrV4llHl74BpY"
 UPLOAD_SHEET_TAB = "Information for Video Uploading"
 
@@ -387,19 +387,23 @@ def _write_upload_csv_fallback(row: dict) -> None:
 
 
 def write_to_upload_sheet(row: dict) -> None:
-    """Append the row to the Google Sheet via service account; falls back to local CSV."""
+    """Append the row to the Google Sheet via OAuth2; falls back to local CSV."""
     import gspread
-    from google.oauth2.service_account import Credentials
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
 
     values = [row.get(col, "") for col in _UPLOAD_CSV_COLS]
-    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+    if not GOOGLE_OAUTH_TOKEN:
         _write_upload_csv_fallback(row)
         return
     try:
-        creds = Credentials.from_service_account_file(
-            GOOGLE_SERVICE_ACCOUNT_JSON,
+        creds = Credentials.from_authorized_user_file(
+            GOOGLE_OAUTH_TOKEN,
             scopes=["https://www.googleapis.com/auth/spreadsheets"],
         )
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            Path(GOOGLE_OAUTH_TOKEN).write_text(creds.to_json())
         gc = gspread.authorize(creds)
         ws = gc.open_by_key(UPLOAD_SHEET_ID).worksheet(UPLOAD_SHEET_TAB)
         ws.append_row(values, value_input_option="USER_ENTERED")
