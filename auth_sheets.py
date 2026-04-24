@@ -16,11 +16,11 @@ from pathlib import Path
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-CLIENT_SECRET = Path.home() / "Desktop" / "client_secret.json"
+CLIENT_SECRET = next((Path.home() / "Desktop").glob("client_secret*.json"), None)
+if CLIENT_SECRET is None:
+    raise SystemExit("No client_secret*.json found on Desktop")
 TOKEN_OUT = Path(__file__).parent / "token.json"
 
-if not CLIENT_SECRET.exists():
-    raise SystemExit(f"client_secret.json not found at {CLIENT_SECRET}")
 
 flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRET), SCOPES)
 creds = flow.run_local_server(port=0)
