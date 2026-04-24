@@ -1,7 +1,11 @@
+import csv
+import io
 import json
 import os
 import re
+import subprocess
 import tempfile
+from datetime import date
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -17,6 +21,14 @@ app = FastAPI()
 
 MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500 MB for direct uploads
 CHUNK_DURATION_MS = 10 * 60 * 1000   # 10 minutes per Whisper chunk
+
+AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN", "")
+AIRTABLE_BASE_ID = "appf82sOr6qFvVj6z"
+AIRTABLE_TASKS_TABLE = "tblnMlOiI3q3Zj4jo"
+
+VIDEOS_UPLOAD_DIR = Path(os.path.expanduser(
+    os.environ.get("VIDEOS_UPLOAD_DIR", "~/Desktop/Videos for Upload")
+))
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -84,8 +96,322 @@ def startup():
 
 
 # ---------------------------------------------------------------------------
+# Filename helpers
+# ---------------------------------------------------------------------------
+
+def extract_video_id(filename: str) -> int | None:
+    """Parse leading Video ID from filenames like '121_What is a Community_Final.mp4'."""
+    m = re.match(r'^(\d+)[_\s]', Path(filename).stem)
+    return int(m.group(1)) if m else None
+
+
+def save_to_upload_folder(filename: str, vtt_content: str) -> None:
+    """Write VTT to ~/Desktop/Videos for Upload if the folder exists."""
+    if VIDEOS_UPLOAD_DIR.is_dir():
+        out = VIDEOS_UPLOAD_DIR / (Path(filename).stem + ".vtt")
+        out.write_text(vtt_content, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Airtable / storyboard helpers
+# ---------------------------------------------------------------------------
+
+_VO_LINE_RE = re.compile(r'(?:Narrator|Dialogue)[^:]*:\s*[""]?(.+)', re.IGNORECASE)
+
+
+def fetch_airtable_record(video_id: int) -> tuple[str, str, str] | None:
+    """Fetch (record_id, topic, storyboard_url) for a Video ID. Returns None if unavailable."""
+    if not AIRTABLE_TOKEN:
+        return None
+    try:
+        with httpx.Client(timeout=15) as client:
+            resp = client.get(
+                f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TASKS_TABLE}",
+                params={
+                    "filterByFormula": f"{{Video ID #}}={video_id}",
+                    "fields[]": ["Video Topic", "Storyboard Link"],
+                    "maxRecords": "1",
+                },
+                headers={"Authorization": f"Bearer {AIRTABLE_TOKEN}"},
+            )
+            resp.raise_for_status()
+        records = resp.json().get("records", [])
+        if not records:
+            return None
+        rec = records[0]
+        record_id = rec["id"]
+        fields = rec.get("fields", {})
+        topic = (fields.get("Video Topic") or "").strip()
+        storyboard_url = fields.get("Storyboard Link", "")
+        return record_id, topic, storyboard_url
+    except Exception:
+        return None
+
+
+def fetch_storyboard_vo(storyboard_url: str) -> str | None:
+    """Parse a Google Doc storyboard URL and return the VO text for use as a Whisper prompt."""
+    if not storyboard_url:
+        return None
+    try:
+        m = re.search(r"/document/d/([a-zA-Z0-9_-]+)", storyboard_url)
+        if not m:
+            return None
+        with httpx.Client(follow_redirects=True, timeout=30) as client:
+            resp = client.get(
+                f"https://docs.google.com/document/d/{m.group(1)}/export?format=txt"
+            )
+            resp.raise_for_status()
+            text = resp.text
+        vo_lines = []
+        for line in text.splitlines():
+            line = line.strip()
+            lm = _VO_LINE_RE.match(line)
+            if lm:
+                content = lm.group(1).strip().strip('"').strip('"').strip('"')
+                if content and not content.startswith("[") and len(content) > 3:
+                    vo_lines.append(content)
+        # Whisper's prompt window is ~224 tokens; 900 chars is a safe limit
+        return " ".join(vo_lines)[:900] if vo_lines else None
+    except Exception:
+        return None
+
+
+def generate_thumbnail(file_path: str, stem: str) -> None:
+    """Extract a frame from the video at ~10 s and save a 552x414 PNG to the upload folder."""
+    if not VIDEOS_UPLOAD_DIR.is_dir():
+        return
+    out_path = VIDEOS_UPLOAD_DIR / f"{stem}.png"
+    if out_path.exists():
+        return
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", "10",
+                "-i", file_path,
+                "-vframes", "1",
+                "-vf", "scale=552:414:force_original_aspect_ratio=increase,crop=552:414",
+                "-q:v", "2",
+                str(out_path),
+            ],
+            capture_output=True,
+            check=True,
+        )
+    except Exception:
+        pass
+
+
+def update_upload_date(record_id: str) -> None:
+    """Set Video Assets Uploaded to today's date on the Airtable record."""
+    if not AIRTABLE_TOKEN or not record_id:
+        return
+    try:
+        with httpx.Client(timeout=15) as client:
+            client.patch(
+                f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TASKS_TABLE}/{record_id}",
+                json={"fields": {"Video Assets Uploaded": date.today().isoformat()}},
+                headers={
+                    "Authorization": f"Bearer {AIRTABLE_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+            )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Master sheet / upload CSV helpers
+# ---------------------------------------------------------------------------
+
+_MASTER_SHEET_CSV_URL = (
+    "https://docs.google.com/spreadsheets/d/"
+    "1h8eckJjQIHForqxywqqEhNJ_3FdE2_fZe66NIUjR5yA"
+    "/export?format=csv&gid=1118701471"
+)
+
+_MASTER_SHEET_COLS = [
+    "Video ID #",
+    "Category",
+    "Topic (Video Name)",
+    "Grade Level",
+    "Standard",
+    "Key Vocab",
+    "Learning Objective",
+    "Topic Question 1 - Freeze Question",
+    "Topic Question 2 - Reflection Ending Question",
+    "Conversation Starter 1",
+    "Conversation Starter 2",
+]
+
+_UPLOAD_CSV_COLS = [
+    "Video ID #",
+    "Sponsor",
+    "Category",
+    "Collection",
+    "Topic (Video Name)",
+    "Video Available for Demo Mode",
+    "Grade Level",
+    "Standard",
+    "Key Vocab",
+    "Learning Objective",
+    "Topic Question 1 - Freeze Question",
+    "Topic Question 2 - Reflection Ending Question",
+    "Conversation Starter 1",
+    "Conversation Starter 2",
+]
+
+_SEL_QUESTION_FIELDS = [
+    "Topic Question 1 - Freeze Question",
+    "Topic Question 2 - Reflection Ending Question",
+    "Conversation Starter 1",
+    "Conversation Starter 2",
+]
+
+_SEL_WORDS_RE = re.compile(
+    r"\b(brave|bravery|courageous|courage|heroic|unfair|injustice|"
+    r"amazing|incredible|wonderful|inspiring|inspire|hopeful|hope|"
+    r"determined|determination|resilient|resilience|proud|joyful|"
+    r"dignity|agency|empowerment|empower)\b",
+    re.IGNORECASE,
+)
+
+_SEL_PHRASES_RE = re.compile(
+    r"how do you think (?:he|she|they|[a-z]+) felt"
+    r"|how did it feel to"
+    r"|imagine how (?:hard|scary|exciting)"
+    r"|what do you feel when"
+    r"|how do you feel about"
+    r"|what would it feel like"
+    r"|how (?:do you think you'?d?|would you) feel"
+    r"|what (?:made|makes) \w+ (?:brave|strong|courageous|determined)"
+    r"|how did \w+ show"
+    r"|what qualities made"
+    r"|what would you do if"
+    r"|if you were .+, how would you feel"
+    r"|why is (?:sharing|kindness|fairness|helping) important"
+    r"|what does this teach us about",
+    re.IGNORECASE,
+)
+
+
+def _has_sel_violation(text: str) -> bool:
+    return bool(_SEL_WORDS_RE.search(text) or _SEL_PHRASES_RE.search(text))
+
+
+def fetch_master_sheet_row(video_id: int) -> dict | None:
+    """Fetch the master Google Sheet CSV and return the row matching video_id."""
+    try:
+        with httpx.Client(follow_redirects=True, timeout=30) as client:
+            resp = client.get(_MASTER_SHEET_CSV_URL)
+            resp.raise_for_status()
+        reader = csv.DictReader(io.StringIO(resp.text))
+        for row in reader:
+            raw_id = row.get("Video ID #", "").strip()
+            try:
+                if int(raw_id) == video_id:
+                    return {col: row.get(col, "").strip() for col in _MASTER_SHEET_COLS}
+            except (ValueError, TypeError):
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def sel_check_and_rewrite(row: dict) -> dict:
+    """Check question fields for SEL violations and auto-rewrite via OpenAI."""
+    row = dict(row)
+    violations = [f for f in _SEL_QUESTION_FIELDS if _has_sel_violation(row.get(f, ""))]
+    if not violations:
+        return row
+
+    client = OpenAI()
+    topic = row.get("Topic (Video Name)", "this video")
+    objective = row.get("Learning Objective", "")
+    vocab = row.get("Key Vocab", "")
+
+    for field in violations:
+        original = row[field]
+        is_freeze = "Freeze Question" in field
+        rewrite_instruction = (
+            "Rewrite as a factual comprehension question anchored to episode content. "
+            "Use What/Who/When/Where/How framing. No emotion, no speculation, no moralizing. "
+            "Return only the rewritten question, nothing else."
+            if is_freeze else
+            "Rewrite to anchor in facts or concrete actions instead of feelings or traits. "
+            "Keep the subject matter. Return only the rewritten question, nothing else."
+        )
+        prompt = (
+            f"You are editing a question for an educational video titled '{topic}'.\n"
+            f"Learning objective: {objective}\n"
+            f"Key vocab: {vocab}\n\n"
+            f"The question below violates SEL (Social-Emotional Learning) guidelines "
+            f"because it uses feelings-speculation, character-trait framing, moralizing, "
+            f"or forbidden SEL words (brave, courage, inspiring, hope, etc.).\n\n"
+            f"Original question: {original}\n\n"
+            f"{rewrite_instruction}"
+        )
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=150,
+                temperature=0.3,
+            )
+            rewritten = response.choices[0].message.content.strip()
+            if rewritten:
+                row[field] = rewritten
+        except Exception:
+            pass
+
+    return row
+
+
+def write_upload_csv(row: dict) -> None:
+    """Append a 14-column upload row to the daily CSV in the Videos for Upload folder."""
+    if not VIDEOS_UPLOAD_DIR.is_dir():
+        return
+    csv_path = VIDEOS_UPLOAD_DIR / f"video-upload-rows-{date.today().isoformat()}.csv"
+    file_exists = csv_path.exists()
+    try:
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=_UPLOAD_CSV_COLS, extrasaction="ignore")
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow({col: row.get(col, "") for col in _UPLOAD_CSV_COLS})
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Transcription helpers
 # ---------------------------------------------------------------------------
+
+# Riptoes is consistently misheared in the opening "where'd you go this time X".
+# This regex catches the phrase regardless of what word Whisper used for the name.
+_RIPTOES_RE = re.compile(
+    r"where'?d?\s+(?:did\s+)?you\s+go\s+this\s+time\s+(\w+)",
+    re.IGNORECASE,
+)
+
+
+def apply_context_corrections(words: list[dict], segments: list[dict]) -> list[dict]:
+    """Fix proper nouns that are deterministic from their surrounding context."""
+    words = [w.copy() for w in words]
+    for seg in segments:
+        m = _RIPTOES_RE.search(seg.get("text", ""))
+        if not m:
+            continue
+        bad = m.group(1).strip().lower()
+        for w in words:
+            if (
+                w["start"] >= seg["start"] - 0.05
+                and w["end"] <= seg["end"] + 0.05
+                and w["word"].strip().lower() == bad
+            ):
+                w["word"] = "Riptoes"
+                break
+    return words
+
 
 def fmt_ts(seconds: float) -> str:
     h = int(seconds // 3600)
@@ -95,14 +421,17 @@ def fmt_ts(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
-def transcribe_chunk(client: OpenAI, chunk_path: str):
+def transcribe_chunk(client: OpenAI, chunk_path: str, prompt: str | None = None):
     with open(chunk_path, "rb") as f:
-        return client.audio.transcriptions.create(
+        kwargs = dict(
             model="whisper-1",
             file=f,
             response_format="verbose_json",
             timestamp_granularities=["word", "segment"],
         )
+        if prompt:
+            kwargs["prompt"] = prompt
+        return client.audio.transcriptions.create(**kwargs)
 
 
 def build_word_highlight_vtt(all_words, all_segments) -> str:
@@ -138,7 +467,7 @@ def build_word_highlight_vtt(all_words, all_segments) -> str:
     return "\n".join(lines)
 
 
-def transcribe_file(file_path: str) -> str:
+def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
     client = OpenAI()
     audio = AudioSegment.from_file(file_path)
     duration_ms = len(audio)
@@ -146,13 +475,14 @@ def transcribe_file(file_path: str) -> str:
     if duration_ms <= CHUNK_DURATION_MS:
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
             audio.export(tmp.name, format="mp3", bitrate="64k")
-            result = transcribe_chunk(client, tmp.name)
+            result = transcribe_chunk(client, tmp.name, prompt=vo_prompt)
             os.unlink(tmp.name)
 
         words = [{"word": w.word, "start": w.start, "end": w.end}
                  for w in (getattr(result, "words", None) or [])]
         segments = [{"start": s.start, "end": s.end, "text": s.text}
                     for s in (getattr(result, "segments", None) or [])]
+        words = apply_context_corrections(words, segments)
         return build_word_highlight_vtt(words, segments)
 
     all_words = []
@@ -165,7 +495,7 @@ def transcribe_file(file_path: str) -> str:
 
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
             chunk.export(tmp.name, format="mp3", bitrate="64k")
-            result = transcribe_chunk(client, tmp.name)
+            result = transcribe_chunk(client, tmp.name, prompt=vo_prompt)
             os.unlink(tmp.name)
 
         for w in getattr(result, "words", None) or []:
@@ -182,6 +512,7 @@ def transcribe_file(file_path: str) -> str:
                 "text": s.text,
             })
 
+    all_words = apply_context_corrections(all_words, all_segments)
     return build_word_highlight_vtt(all_words, all_segments)
 
 
@@ -212,7 +543,6 @@ def download_url_to_temp(url: str) -> tuple[str, str, int]:
         content_disposition = r.headers.get("content-disposition", "")
         filename = None
         if content_disposition:
-            import re
             m = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';]+)', content_disposition, re.IGNORECASE)
             if m:
                 filename = unquote(m.group(1).strip())
@@ -416,10 +746,11 @@ HTML_PAGE = """
     urlStatus.className = 'status';
     urlStatus.textContent = 'Downloading and transcribing…';
     try {
+      const body = 'url=' + encodeURIComponent(url);
       const res = await fetch('/transcribe-url', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'url=' + encodeURIComponent(url),
+        body,
       });
       if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Failed'); }
       const blob = await res.blob();
@@ -537,19 +868,32 @@ async def transcribe(request: Request, file: UploadFile = File(...)):
     if len(contents) > MAX_UPLOAD_SIZE:
         raise HTTPException(status_code=413, detail="File exceeds 500 MB limit.")
 
+    original_name = file.filename or "unknown"
+    stem = Path(original_name).stem
+    video_id = extract_video_id(original_name)
+    airtable = fetch_airtable_record(video_id) if video_id is not None else None
+    record_id, topic, storyboard_url = airtable if airtable else (None, stem, "")
+    vo_prompt = fetch_storyboard_vo(storyboard_url)
+
     suffix = Path(file.filename).suffix if file.filename else ".mp4"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
         tmp.write(contents)
         tmp.close()
 
-        vtt_text = transcribe_file(tmp.name)
+        vtt_text = transcribe_file(tmp.name, vo_prompt=vo_prompt)
 
         ip = request.client.host if request.client else None
-        original_name = file.filename or "unknown"
         save_transcription(original_name, len(contents), vtt_text, ip)
+        save_to_upload_folder(original_name, vtt_text)
+        generate_thumbnail(tmp.name, stem)
+        update_upload_date(record_id)
+        master_row = fetch_master_sheet_row(video_id) if video_id is not None else None
+        if master_row:
+            master_row = sel_check_and_rewrite(master_row)
+            write_upload_csv(master_row)
 
-        out_name = Path(file.filename).stem + ".vtt" if file.filename else "subtitles.vtt"
+        out_name = stem + ".vtt"
         return Response(
             content=vtt_text,
             media_type="text/vtt",
@@ -568,13 +912,26 @@ async def transcribe_url(request: Request, url: str = Form(...)):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Download failed: {exc}")
 
+    stem = Path(filename).stem
+    video_id = extract_video_id(filename)
+    airtable = fetch_airtable_record(video_id) if video_id is not None else None
+    record_id, topic, storyboard_url = airtable if airtable else (None, stem, "")
+    vo_prompt = fetch_storyboard_vo(storyboard_url)
+
     try:
-        vtt_text = transcribe_file(file_path)
+        vtt_text = transcribe_file(file_path, vo_prompt=vo_prompt)
 
         ip = request.client.host if request.client else None
         save_transcription(filename, file_size, vtt_text, ip)
+        save_to_upload_folder(filename, vtt_text)
+        generate_thumbnail(file_path, stem)
+        update_upload_date(record_id)
+        master_row = fetch_master_sheet_row(video_id) if video_id is not None else None
+        if master_row:
+            master_row = sel_check_and_rewrite(master_row)
+            write_upload_csv(master_row)
 
-        out_name = Path(filename).stem + ".vtt"
+        out_name = stem + ".vtt"
         return Response(
             content=vtt_text,
             media_type="text/vtt",
@@ -611,8 +968,20 @@ async def batch(request: Request, urls: str):
 
             try:
                 yield f"data: {json.dumps({'index': i, 'status': 'transcribing'})}\n\n"
-                vtt_text = transcribe_file(file_path)
+                fstem = Path(filename).stem
+                vid = extract_video_id(filename)
+                at = fetch_airtable_record(vid) if vid is not None else None
+                b_record_id, b_topic, b_storyboard = at if at else (None, fstem, "")
+                vo_prompt = fetch_storyboard_vo(b_storyboard)
+                vtt_text = transcribe_file(file_path, vo_prompt=vo_prompt)
                 tid = save_transcription(filename, file_size, vtt_text, ip)
+                save_to_upload_folder(filename, vtt_text)
+                generate_thumbnail(file_path, fstem)
+                update_upload_date(b_record_id)
+                b_master = fetch_master_sheet_row(vid) if vid is not None else None
+                if b_master:
+                    b_master = sel_check_and_rewrite(b_master)
+                    write_upload_csv(b_master)
                 yield f"data: {json.dumps({'index': i, 'status': 'done', 'id': tid})}\n\n"
             except Exception as exc:
                 yield f"data: {json.dumps({'index': i, 'status': 'error', 'message': f'Transcription failed: {exc}'})}\n\n"
@@ -649,8 +1018,8 @@ async def history():
     for row in rows:
         tid, fname, fsize, dur, created = row
         size_mb = f"{fsize / 1024 / 1024:.1f} MB"
-        duration = f"{dur:.0f}s" if dur else "\u2014"
-        date = created.strftime("%Y-%m-%d %H:%M") if created else "\u2014"
+        duration = f"{dur:.0f}s" if dur else "—"
+        date = created.strftime("%Y-%m-%d %H:%M") if created else "—"
         table_rows += (
             f"<tr>"
             f"<td>{fname}</td>"
