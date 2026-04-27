@@ -455,24 +455,67 @@ _RIPTOES_RE = re.compile(
 )
 
 
+def _has_riptoes_opening(segments: list[dict]) -> bool:
+    """Return True if the opening phrase is already captured in the first 10 seconds."""
+    for seg in segments:
+        if seg["start"] > 10:
+            break
+        text = seg.get("text", "")
+        if "riptoes" in text.lower() or bool(_RIPTOES_RE.search(text)):
+            return True
+    return False
+
+
+def _targeted_opening_pass(
+    client: OpenAI, audio_orig: AudioSegment
+) -> tuple[list[dict], list[dict]] | None:
+    """
+    Whisper drops speech-over-music at the very start. Run a second, focused
+    pass on the first 15 seconds with a 2-second warmup pad and a phrase prompt.
+    Returns (words, segments) in original-audio time, or None if still not found.
+    """
+    PAD_S = 2.0
+    clip = (
+        AudioSegment.silent(duration=int(PAD_S * 1000), frame_rate=audio_orig.frame_rate)
+        + audio_orig[:15000]
+    )
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+        clip.export(tmp.name, format="mp3", bitrate="64k")
+        try:
+            result = transcribe_chunk(client, tmp.name, prompt="Where'd you go this time Riptoes")
+        finally:
+            os.unlink(tmp.name)
+
+    raw_segs = getattr(result, "segments", None) or []
+    raw_words = getattr(result, "words", None) or []
+
+    if not any(
+        "riptoes" in s.text.lower() or bool(_RIPTOES_RE.search(s.text))
+        for s in raw_segs
+    ):
+        logger.info("_targeted_opening_pass: phrase not found even in targeted pass")
+        return None
+
+    words = [
+        {"word": w.word, "start": max(0.0, w.start - PAD_S), "end": max(0.0, w.end - PAD_S)}
+        for w in raw_words
+    ]
+    segs = [
+        {"start": max(0.0, s.start - PAD_S), "end": max(0.0, s.end - PAD_S), "text": s.text}
+        for s in raw_segs
+    ]
+    logger.info("_targeted_opening_pass: found opening phrase, first seg at %.2fs", segs[0]["start"] if segs else 0)
+    return words, segs
+
+
 def ensure_riptoes_opening(words: list[dict], segments: list[dict]) -> tuple[list[dict], list[dict]]:
     """
-    Every Riptoes video opens with 'Where'd you go this time Riptoes'.
-    Whisper reliably drops this over the intro music. If it's absent from
-    the first 10 seconds, inject a synthetic segment so it always appears.
+    Last-resort fallback: inject a synthetic segment at the start when the targeted
+    pass also failed to find the opening phrase.
     """
     if not segments:
         return words, segments
 
-    # Check whether Riptoes already appears in the first 10 seconds
-    for seg in segments:
-        if seg["start"] > 10:
-            break
-        if "riptoes" in seg["text"].lower():
-            return words, segments
-
-    # Only inject if transcription starts suspiciously late (> 1.5s),
-    # meaning Whisper skipped genuine opening content.
     first_start = segments[0]["start"]
     if first_start < 1.5:
         return words, segments
@@ -578,14 +621,13 @@ def build_word_highlight_vtt(all_words, all_segments) -> str:
 
 def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
     client = OpenAI()
-    audio = AudioSegment.from_file(file_path)
+    audio_orig = AudioSegment.from_file(file_path)
 
-    # Whisper frequently drops the very first utterance. Prepending 1 s of silence
-    # forces the model to "warm up" before the speech starts, then we subtract the
-    # offset from all returned timestamps.
+    # Prepend 1 s of silence so Whisper "warms up" before speech starts;
+    # subtract that offset from all returned timestamps.
     PAD_MS = 1000
     pad_s = PAD_MS / 1000.0
-    audio = AudioSegment.silent(duration=PAD_MS, frame_rate=audio.frame_rate) + audio
+    audio = AudioSegment.silent(duration=PAD_MS, frame_rate=audio_orig.frame_rate) + audio_orig
     duration_ms = len(audio)
 
     if duration_ms <= CHUNK_DURATION_MS:
@@ -598,42 +640,51 @@ def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
                  for w in (getattr(result, "words", None) or [])]
         segments = [{"start": max(0.0, s.start - pad_s), "end": max(0.0, s.end - pad_s), "text": s.text}
                     for s in (getattr(result, "segments", None) or [])]
-        words, segments = ensure_riptoes_opening(words, segments)
-        words = apply_context_corrections(words, segments)
-        return build_word_highlight_vtt(words, segments)
+    else:
+        words = []
+        segments = []
 
-    all_words = []
-    all_segments = []
+        for chunk_start_ms in range(0, duration_ms, CHUNK_DURATION_MS):
+            chunk_end_ms = min(chunk_start_ms + CHUNK_DURATION_MS, duration_ms)
+            chunk = audio[chunk_start_ms:chunk_end_ms]
+            offset_s = chunk_start_ms / 1000.0 - pad_s
 
-    for chunk_start_ms in range(0, duration_ms, CHUNK_DURATION_MS):
-        chunk_end_ms = min(chunk_start_ms + CHUNK_DURATION_MS, duration_ms)
-        chunk = audio[chunk_start_ms:chunk_end_ms]
-        # Subtract the silence pad from every chunk's offset so timestamps
-        # map back to original audio time.
-        offset_s = chunk_start_ms / 1000.0 - pad_s
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                chunk.export(tmp.name, format="mp3", bitrate="64k")
+                result = transcribe_chunk(client, tmp.name, prompt=vo_prompt)
+                os.unlink(tmp.name)
 
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            chunk.export(tmp.name, format="mp3", bitrate="64k")
-            result = transcribe_chunk(client, tmp.name, prompt=vo_prompt)
-            os.unlink(tmp.name)
+            for w in getattr(result, "words", None) or []:
+                words.append({"word": w.word, "start": max(0.0, w.start + offset_s), "end": max(0.0, w.end + offset_s)})
+            for s in getattr(result, "segments", None) or []:
+                segments.append({"start": max(0.0, s.start + offset_s), "end": max(0.0, s.end + offset_s), "text": s.text})
 
-        for w in getattr(result, "words", None) or []:
-            all_words.append({
-                "word": w.word,
-                "start": max(0.0, w.start + offset_s),
-                "end": max(0.0, w.end + offset_s),
-            })
+    # If the opening phrase is absent, run a targeted second pass on the first
+    # 15 seconds with a strong prompt and a longer warmup pad.
+    if not _has_riptoes_opening(segments):
+        logger.info("transcribe_file: opening phrase missing, running targeted pass")
+        opening = _targeted_opening_pass(client, audio_orig)
+        if opening:
+            o_words, o_segs = opening
+            # Use the targeted-pass results for the first 10 s; keep the main
+            # transcription for everything after that to avoid duplicates.
+            OPENING_WINDOW_S = 10.0
+            segments = sorted(
+                [s for s in o_segs if s["start"] < OPENING_WINDOW_S]
+                + [s for s in segments if s["start"] >= OPENING_WINDOW_S],
+                key=lambda s: s["start"],
+            )
+            words = sorted(
+                [w for w in o_words if w["start"] < OPENING_WINDOW_S]
+                + [w for w in words if w["start"] >= OPENING_WINDOW_S],
+                key=lambda w: w["start"],
+            )
+        else:
+            # Both passes failed — inject a synthetic segment as a last resort.
+            words, segments = ensure_riptoes_opening(words, segments)
 
-        for s in getattr(result, "segments", None) or []:
-            all_segments.append({
-                "start": max(0.0, s.start + offset_s),
-                "end": max(0.0, s.end + offset_s),
-                "text": s.text,
-            })
-
-    all_words, all_segments = ensure_riptoes_opening(all_words, all_segments)
-    all_words = apply_context_corrections(all_words, all_segments)
-    return build_word_highlight_vtt(all_words, all_segments)
+    words = apply_context_corrections(words, segments)
+    return build_word_highlight_vtt(words, segments)
 
 
 CONTENT_TYPE_SUFFIX = {
