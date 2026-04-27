@@ -547,6 +547,13 @@ def build_word_highlight_vtt(all_words, all_segments) -> str:
 def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
     client = OpenAI()
     audio = AudioSegment.from_file(file_path)
+
+    # Whisper frequently drops the very first utterance. Prepending 1 s of silence
+    # forces the model to "warm up" before the speech starts, then we subtract the
+    # offset from all returned timestamps.
+    PAD_MS = 1000
+    pad_s = PAD_MS / 1000.0
+    audio = AudioSegment.silent(duration=PAD_MS, frame_rate=audio.frame_rate) + audio
     duration_ms = len(audio)
 
     if duration_ms <= CHUNK_DURATION_MS:
@@ -555,9 +562,9 @@ def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
             result = transcribe_chunk(client, tmp.name, prompt=vo_prompt)
             os.unlink(tmp.name)
 
-        words = [{"word": w.word, "start": w.start, "end": w.end}
+        words = [{"word": w.word, "start": max(0.0, w.start - pad_s), "end": max(0.0, w.end - pad_s)}
                  for w in (getattr(result, "words", None) or [])]
-        segments = [{"start": s.start, "end": s.end, "text": s.text}
+        segments = [{"start": max(0.0, s.start - pad_s), "end": max(0.0, s.end - pad_s), "text": s.text}
                     for s in (getattr(result, "segments", None) or [])]
         words = apply_context_corrections(words, segments)
         return build_word_highlight_vtt(words, segments)
@@ -568,7 +575,9 @@ def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
     for chunk_start_ms in range(0, duration_ms, CHUNK_DURATION_MS):
         chunk_end_ms = min(chunk_start_ms + CHUNK_DURATION_MS, duration_ms)
         chunk = audio[chunk_start_ms:chunk_end_ms]
-        offset_s = chunk_start_ms / 1000.0
+        # Subtract the silence pad from every chunk's offset so timestamps
+        # map back to original audio time.
+        offset_s = chunk_start_ms / 1000.0 - pad_s
 
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
             chunk.export(tmp.name, format="mp3", bitrate="64k")
@@ -578,14 +587,14 @@ def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
         for w in getattr(result, "words", None) or []:
             all_words.append({
                 "word": w.word,
-                "start": w.start + offset_s,
-                "end": w.end + offset_s,
+                "start": max(0.0, w.start + offset_s),
+                "end": max(0.0, w.end + offset_s),
             })
 
         for s in getattr(result, "segments", None) or []:
             all_segments.append({
-                "start": s.start + offset_s,
-                "end": s.end + offset_s,
+                "start": max(0.0, s.start + offset_s),
+                "end": max(0.0, s.end + offset_s),
                 "text": s.text,
             })
 
