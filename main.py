@@ -453,6 +453,36 @@ _RIPTOES_RE = re.compile(
 )
 
 
+def ensure_riptoes_opening(words: list[dict], segments: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Every Riptoes video opens with 'Where'd you go this time Riptoes'.
+    Whisper reliably drops this over the intro music. If it's absent from
+    the first 10 seconds, inject a synthetic segment so it always appears.
+    """
+    if not segments:
+        return words, segments
+
+    # Check whether Riptoes already appears in the first 10 seconds
+    for seg in segments:
+        if seg["start"] > 10:
+            break
+        if "riptoes" in seg["text"].lower():
+            return words, segments
+
+    # Only inject if transcription starts suspiciously late (> 1.5s),
+    # meaning Whisper skipped genuine opening content.
+    first_start = segments[0]["start"]
+    if first_start < 1.5:
+        return words, segments
+
+    opening = {
+        "start": 0.0,
+        "end": min(first_start, 4.0),
+        "text": "Where'd you go this time Riptoes",
+    }
+    return words, [opening] + segments
+
+
 def apply_context_corrections(words: list[dict], segments: list[dict]) -> list[dict]:
     """Fix proper nouns that are deterministic from their surrounding context."""
     words = [w.copy() for w in words]
@@ -566,6 +596,7 @@ def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
                  for w in (getattr(result, "words", None) or [])]
         segments = [{"start": max(0.0, s.start - pad_s), "end": max(0.0, s.end - pad_s), "text": s.text}
                     for s in (getattr(result, "segments", None) or [])]
+        words, segments = ensure_riptoes_opening(words, segments)
         words = apply_context_corrections(words, segments)
         return build_word_highlight_vtt(words, segments)
 
@@ -598,6 +629,7 @@ def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
                 "text": s.text,
             })
 
+    all_words, all_segments = ensure_riptoes_opening(all_words, all_segments)
     all_words = apply_context_corrections(all_words, all_segments)
     return build_word_highlight_vtt(all_words, all_segments)
 
