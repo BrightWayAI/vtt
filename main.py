@@ -500,16 +500,27 @@ def build_word_highlight_vtt(all_words, all_segments) -> str:
     lines = ["WEBVTT", "Kind: captions", "Language: en", ""]
 
     for seg in all_segments:
+        # Match words by start time falling within the segment — more robust than
+        # filtering by end time, which Whisper sometimes places outside segment bounds.
         seg_words = [
             w for w in all_words
-            if w["start"] >= seg["start"] - 0.01 and w["end"] <= seg["end"] + 0.01
+            if w["start"] >= seg["start"] - 0.05 and w["start"] < seg["end"] + 0.05
         ]
         if not seg_words:
             continue
 
         for i, word in enumerate(seg_words):
-            start = fmt_ts(word["start"])
-            end = fmt_ts(word["end"])
+            cue_start = word["start"]
+            # Stretch each word's cue to the next word's start so there are no
+            # gaps where the subtitle disappears mid-sentence.
+            if i + 1 < len(seg_words):
+                cue_end = seg_words[i + 1]["start"]
+            else:
+                cue_end = max(word["end"], seg["end"])
+
+            # Guard against zero-duration or negative cues.
+            if cue_end <= cue_start:
+                cue_end = cue_start + 0.05
 
             parts = []
             for j, w in enumerate(seg_words):
@@ -519,7 +530,7 @@ def build_word_highlight_vtt(all_words, all_segments) -> str:
                 else:
                     parts.append(txt)
 
-            lines.append(f"{start} --> {end}")
+            lines.append(f"{fmt_ts(cue_start)} --> {fmt_ts(cue_end)}")
             lines.append(" ".join(parts))
             lines.append("")
 
