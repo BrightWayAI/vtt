@@ -494,7 +494,7 @@ def transcribe_chunk(client: OpenAI, chunk_path: str, prompt: str | None = None)
 
 
 def build_word_highlight_vtt(all_words, all_segments) -> str:
-    if not all_words:
+    if not all_words and not all_segments:
         return "WEBVTT\nKind: captions\nLanguage: en\n\n"
 
     lines = ["WEBVTT", "Kind: captions", "Language: en", ""]
@@ -507,6 +507,13 @@ def build_word_highlight_vtt(all_words, all_segments) -> str:
             if w["start"] >= seg["start"] - 0.05 and w["start"] < seg["end"] + 0.05
         ]
         if not seg_words:
+            # Whisper didn't return word-level timestamps for this segment.
+            # Emit a plain cue using segment boundaries so no content is lost.
+            seg_start = seg["start"]
+            seg_end = seg["end"] if seg["end"] > seg["start"] else seg["start"] + 0.05
+            lines.append(f"{fmt_ts(seg_start)} --> {fmt_ts(seg_end)}")
+            lines.append(seg["text"].strip())
+            lines.append("")
             continue
 
         for i, word in enumerate(seg_words):
