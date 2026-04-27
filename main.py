@@ -26,7 +26,7 @@ app = FastAPI()
 MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500 MB for direct uploads
 CHUNK_DURATION_MS = 10 * 60 * 1000   # 10 minutes per Whisper chunk
 
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "gpt-4o-transcribe")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
 
 AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE_ID = "appf82sOr6qFvVj6z"
