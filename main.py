@@ -33,6 +33,7 @@ AIRTABLE_TASKS_TABLE = "tblnMlOiI3q3Zj4jo"
 VIDEOS_UPLOAD_DIR = Path(os.path.expanduser(
     os.environ.get("VIDEOS_UPLOAD_DIR", "~/Desktop/Videos for Upload")
 ))
+THUMBNAIL_DIR = Path(tempfile.gettempdir()) / "vtt_thumbnails"
 
 GOOGLE_OAUTH_TOKEN = os.environ.get("GOOGLE_OAUTH_TOKEN", "")
 UPLOAD_SHEET_ID = "1OUQ0NyIaCOsPvYUCQhJ41roINv9fT9wrV4llHl74BpY"
@@ -184,14 +185,13 @@ def fetch_storyboard_vo(storyboard_url: str) -> str | None:
         return None
 
 
-def generate_thumbnail(file_path: str, stem: str) -> None:
-    """Extract a frame from the video at ~10 s and save a 552x414 PNG to the upload folder."""
-    if not VIDEOS_UPLOAD_DIR.is_dir():
-        logger.warning("generate_thumbnail: VIDEOS_UPLOAD_DIR does not exist: %s", VIDEOS_UPLOAD_DIR)
-        return
-    out_path = VIDEOS_UPLOAD_DIR / f"{stem}.png"
+def generate_thumbnail(file_path: str, stem: str) -> bool:
+    """Extract a frame at ~10 s and save a 552x414 PNG. Returns True if saved."""
+    out_dir = VIDEOS_UPLOAD_DIR if VIDEOS_UPLOAD_DIR.is_dir() else THUMBNAIL_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{stem}.png"
     if out_path.exists():
-        return
+        return True
     try:
         subprocess.run(
             [
@@ -207,8 +207,18 @@ def generate_thumbnail(file_path: str, stem: str) -> None:
             check=True,
         )
         logger.info("generate_thumbnail: saved %s", out_path)
+        return True
     except Exception as exc:
         logger.error("generate_thumbnail failed: %s", exc)
+        return False
+
+
+def get_thumbnail_path(stem: str) -> Path | None:
+    for d in [VIDEOS_UPLOAD_DIR, THUMBNAIL_DIR]:
+        p = d / f"{stem}.png"
+        if p.exists():
+            return p
+    return None
 
 
 def update_upload_date(record_id: str) -> None:
@@ -773,8 +783,10 @@ HTML_PAGE = """
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const name = file.name.replace(/\\.[^.]+$/, '') + '.vtt';
+      const thumbUrl = res.headers.get('X-Thumbnail-URL');
       fileStatus.className = 'status success';
-      fileStatus.innerHTML = '<a href="' + url + '" download="' + name + '">Download ' + name + '</a>';
+      fileStatus.innerHTML = '<a href="' + url + '" download="' + name + '">Download ' + name + '</a>'
+        + (thumbUrl ? ' &nbsp; <a href="' + thumbUrl + '" download>Download thumbnail</a>' : '');
     } catch (err) {
       fileStatus.className = 'status error';
       fileStatus.textContent = err.message;
@@ -807,8 +819,10 @@ HTML_PAGE = """
       const match = disp.match(/filename="(.+?)"/);
       const name = match ? match[1] : 'subtitles.vtt';
       const blobUrl = URL.createObjectURL(blob);
+      const thumbUrl2 = res.headers.get('X-Thumbnail-URL');
       urlStatus.className = 'status success';
-      urlStatus.innerHTML = '<a href="' + blobUrl + '" download="' + name + '">Download ' + name + '</a>';
+      urlStatus.innerHTML = '<a href="' + blobUrl + '" download="' + name + '">Download ' + name + '</a>'
+        + (thumbUrl2 ? ' &nbsp; <a href="' + thumbUrl2 + '" download>Download thumbnail</a>' : '');
     } catch (err) {
       urlStatus.className = 'status error';
       urlStatus.textContent = err.message;
@@ -943,11 +957,10 @@ async def transcribe(request: Request, file: UploadFile = File(...)):
             write_to_upload_sheet(master_row)
 
         out_name = stem + ".vtt"
-        return Response(
-            content=vtt_text,
-            media_type="text/vtt",
-            headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
-        )
+        resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
+        if get_thumbnail_path(stem):
+            resp_headers["X-Thumbnail-URL"] = f"/thumbnail/{stem}"
+        return Response(content=vtt_text, media_type="text/vtt", headers=resp_headers)
     finally:
         os.unlink(tmp.name)
 
@@ -981,11 +994,10 @@ async def transcribe_url(request: Request, url: str = Form(...)):
             write_to_upload_sheet(master_row)
 
         out_name = stem + ".vtt"
-        return Response(
-            content=vtt_text,
-            media_type="text/vtt",
-            headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
-        )
+        resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
+        if get_thumbnail_path(stem):
+            resp_headers["X-Thumbnail-URL"] = f"/thumbnail/{stem}"
+        return Response(content=vtt_text, media_type="text/vtt", headers=resp_headers)
     finally:
         os.unlink(file_path)
 
@@ -1114,6 +1126,18 @@ async def download(transcription_id: int):
         content=vtt,
         media_type="text/vtt",
         headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
+    )
+
+
+@app.get("/thumbnail/{stem}")
+async def thumbnail(stem: str):
+    path = get_thumbnail_path(stem)
+    if not path:
+        raise HTTPException(status_code=404, detail="Thumbnail not found.")
+    return Response(
+        content=path.read_bytes(),
+        media_type="image/png",
+        headers={"Content-Disposition": f'attachment; filename="{stem}.png"'},
     )
 
 
