@@ -1113,3 +1113,58 @@ async def download(transcription_id: int):
         media_type="text/vtt",
         headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
     )
+
+
+@app.get("/debug")
+async def debug():
+    status = {}
+
+    # Env vars
+    status["GOOGLE_OAUTH_TOKEN_set"] = bool(GOOGLE_OAUTH_TOKEN)
+    status["AIRTABLE_TOKEN_set"] = bool(AIRTABLE_TOKEN)
+    status["VIDEOS_UPLOAD_DIR"] = str(VIDEOS_UPLOAD_DIR)
+    status["VIDEOS_UPLOAD_DIR_exists"] = VIDEOS_UPLOAD_DIR.is_dir()
+
+    # ffmpeg
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=5)
+        status["ffmpeg"] = "ok"
+    except Exception as exc:
+        status["ffmpeg"] = f"error: {exc}"
+
+    # Google Sheets connection
+    if GOOGLE_OAUTH_TOKEN:
+        try:
+            import gspread
+            from google.oauth2.credentials import Credentials
+            from google.auth.transport.requests import Request as GRequest
+            if GOOGLE_OAUTH_TOKEN.strip().startswith("{"):
+                info = json.loads(GOOGLE_OAUTH_TOKEN)
+                creds = Credentials.from_authorized_user_info(
+                    info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+                )
+            else:
+                creds = Credentials.from_authorized_user_file(
+                    GOOGLE_OAUTH_TOKEN, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+                )
+            if creds.expired and creds.refresh_token:
+                creds.refresh(GRequest())
+            gc = gspread.authorize(creds)
+            ws = gc.open_by_key(UPLOAD_SHEET_ID).worksheet(UPLOAD_SHEET_TAB)
+            status["sheets"] = f"ok — connected to '{ws.title}'"
+        except Exception as exc:
+            status["sheets"] = f"error: {exc}"
+    else:
+        status["sheets"] = "skipped — GOOGLE_OAUTH_TOKEN not set"
+
+    # Master sheet reachable
+    try:
+        with httpx.Client(follow_redirects=True, timeout=10) as client:
+            resp = client.get(_MASTER_SHEET_CSV_URL)
+            resp.raise_for_status()
+            row_count = len(resp.text.splitlines())
+        status["master_sheet"] = f"ok — {row_count} rows"
+    except Exception as exc:
+        status["master_sheet"] = f"error: {exc}"
+
+    return status
