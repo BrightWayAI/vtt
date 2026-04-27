@@ -406,9 +406,11 @@ def write_to_upload_sheet(row: dict) -> None:
         _write_upload_csv_fallback(row)
         return
     try:
-        # Env var can be raw JSON (Railway) or a file path (local)
+        # Env var can be raw JSON (Railway) or a file path (local).
+        # Strip control characters that get introduced when pasting into Railway.
         if GOOGLE_OAUTH_TOKEN.strip().startswith("{"):
-            info = json.loads(GOOGLE_OAUTH_TOKEN)
+            clean = re.sub(r"[\x00-\x1f\x7f]", "", GOOGLE_OAUTH_TOKEN)
+            info = json.loads(clean)
             creds = Credentials.from_authorized_user_info(
                 info,
                 scopes=["https://www.googleapis.com/auth/spreadsheets"],
@@ -1139,7 +1141,7 @@ async def debug():
             from google.oauth2.credentials import Credentials
             from google.auth.transport.requests import Request as GRequest
             if GOOGLE_OAUTH_TOKEN.strip().startswith("{"):
-                info = json.loads(GOOGLE_OAUTH_TOKEN)
+                info = json.loads(re.sub(r"[\x00-\x1f\x7f]", "", GOOGLE_OAUTH_TOKEN))
                 creds = Credentials.from_authorized_user_info(
                     info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
                 )
