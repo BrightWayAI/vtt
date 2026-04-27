@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import logging
 import os
 import re
 import subprocess
@@ -16,6 +17,9 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydub import AudioSegment
 
 from openai import OpenAI
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -183,6 +187,7 @@ def fetch_storyboard_vo(storyboard_url: str) -> str | None:
 def generate_thumbnail(file_path: str, stem: str) -> None:
     """Extract a frame from the video at ~10 s and save a 552x414 PNG to the upload folder."""
     if not VIDEOS_UPLOAD_DIR.is_dir():
+        logger.warning("generate_thumbnail: VIDEOS_UPLOAD_DIR does not exist: %s", VIDEOS_UPLOAD_DIR)
         return
     out_path = VIDEOS_UPLOAD_DIR / f"{stem}.png"
     if out_path.exists():
@@ -201,8 +206,9 @@ def generate_thumbnail(file_path: str, stem: str) -> None:
             capture_output=True,
             check=True,
         )
-    except Exception:
-        pass
+        logger.info("generate_thumbnail: saved %s", out_path)
+    except Exception as exc:
+        logger.error("generate_thumbnail failed: %s", exc)
 
 
 def update_upload_date(record_id: str) -> None:
@@ -313,11 +319,13 @@ def fetch_master_sheet_row(video_id: int) -> dict | None:
             raw_id = row.get("Video ID #", "").strip()
             try:
                 if int(raw_id) == video_id:
+                    logger.info("fetch_master_sheet_row: found Video ID %s", video_id)
                     return {col: row.get(col, "").strip() for col in _MASTER_SHEET_COLS}
             except (ValueError, TypeError):
                 continue
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.error("fetch_master_sheet_row failed: %s", exc)
+    logger.warning("fetch_master_sheet_row: no row found for Video ID %s", video_id)
     return None
 
 
@@ -394,6 +402,7 @@ def write_to_upload_sheet(row: dict) -> None:
 
     values = [row.get(col, "") for col in _UPLOAD_CSV_COLS]
     if not GOOGLE_OAUTH_TOKEN:
+        logger.warning("write_to_upload_sheet: GOOGLE_OAUTH_TOKEN not set, falling back to CSV")
         _write_upload_csv_fallback(row)
         return
     try:
@@ -414,7 +423,9 @@ def write_to_upload_sheet(row: dict) -> None:
         gc = gspread.authorize(creds)
         ws = gc.open_by_key(UPLOAD_SHEET_ID).worksheet(UPLOAD_SHEET_TAB)
         ws.append_row(values, value_input_option="USER_ENTERED")
-    except Exception:
+        logger.info("write_to_upload_sheet: appended row for Video ID %s", row.get("Video ID #"))
+    except Exception as exc:
+        logger.error("write_to_upload_sheet failed: %s", exc, exc_info=True)
         _write_upload_csv_fallback(row)
 
 
