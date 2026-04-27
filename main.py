@@ -26,6 +26,8 @@ app = FastAPI()
 MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500 MB for direct uploads
 CHUNK_DURATION_MS = 10 * 60 * 1000   # 10 minutes per Whisper chunk
 
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "gpt-4o-transcribe")
+
 AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE_ID = "appf82sOr6qFvVj6z"
 AIRTABLE_TASKS_TABLE = "tblnMlOiI3q3Zj4jo"
@@ -513,7 +515,7 @@ def fmt_ts(seconds: float) -> str:
 def transcribe_chunk(client: OpenAI, chunk_path: str, prompt: str | None = None):
     with open(chunk_path, "rb") as f:
         kwargs = dict(
-            model="whisper-1",
+            model=WHISPER_MODEL,
             file=f,
             response_format="verbose_json",
             timestamp_granularities=["word", "segment"],
