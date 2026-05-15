@@ -27,6 +27,23 @@ MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500 MB for direct uploads
 CHUNK_DURATION_MS = 10 * 60 * 1000   # 10 minutes per Whisper chunk
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
+CAPTION_CLEANUP_MODEL = os.environ.get("CAPTION_CLEANUP_MODEL", "gpt-4o-mini")
+ENABLE_CAPTION_CLEANUP = os.environ.get("ENABLE_CAPTION_CLEANUP", "1").lower() not in {"0", "false", "no"}
+
+CAPTION_MIN_DURATION_S = 1.2
+CAPTION_MAX_DURATION_S = 4.5
+CAPTION_MAX_GAP_S = 0.35
+CAPTION_MAX_CHARS = 84
+CAPTION_MAX_WORDS = 16
+CAPTION_LINE_CHARS = 42
+CAPTION_CLEANUP_BATCH_SIZE = 20
+CAPTION_CLEANUP_BATCH_CHARS = 2500
+TRANSCRIPTION_MAX_ATTEMPTS = 2
+MIN_VALID_CUE_DURATION_S = 0.05
+MIN_VALID_TEXT_CHARS = 8
+HIGHLIGHT_MAX_CHARS = 45
+HIGHLIGHT_MAX_WORDS = 8
+HIGHLIGHT_MAX_GAP_S = 0.9
 
 AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE_ID = "appf82sOr6qFvVj6z"
@@ -50,6 +67,14 @@ def get_db():
     if not url:
         return None
     return psycopg2.connect(url)
+
+
+def require_openai_api_key() -> None:
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise HTTPException(
+            status_code=503,
+            detail="OPENAI_API_KEY is not set. Add your OpenAI API key to the server environment and retry.",
+        )
 
 
 def init_db():
@@ -552,6 +577,15 @@ def fmt_ts(seconds: float) -> str:
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
     ms = int(round((seconds % 1) * 1000))
+    if ms == 1000:
+        s += 1
+        ms = 0
+    if s == 60:
+        m += 1
+        s = 0
+    if m == 60:
+        h += 1
+        m = 0
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
@@ -568,60 +602,478 @@ def transcribe_chunk(client: OpenAI, chunk_path: str, prompt: str | None = None)
         return client.audio.transcriptions.create(**kwargs)
 
 
-def build_word_highlight_vtt(all_words, all_segments) -> str:
+def normalize_caption_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def ends_sentence(text: str) -> bool:
+    return bool(re.search(r'[.!?]["\']?$', text.strip()))
+
+
+def split_caption_text(text: str) -> list[str]:
+    text = normalize_caption_text(text)
+    if not text:
+        return []
+
+    words = text.split()
+    parts: list[str] = []
+    current: list[str] = []
+
+    for word in words:
+        candidate_words = current + [word]
+        candidate = " ".join(candidate_words)
+        if current and (
+            len(candidate) > CAPTION_MAX_CHARS or len(candidate_words) > CAPTION_MAX_WORDS
+        ):
+            parts.append(" ".join(current))
+            current = [word]
+        else:
+            current = candidate_words
+
+        current_text = " ".join(current)
+        if len(current) >= 4 and ends_sentence(current_text):
+            parts.append(current_text)
+            current = []
+
+    if current:
+        parts.append(" ".join(current))
+
+    if len(parts) >= 2 and len(parts[-1].split()) <= 2:
+        parts[-2] = f"{parts[-2]} {parts[-1]}".strip()
+        parts.pop()
+
+    return parts
+
+
+def distribute_segment_text(seg: dict) -> list[dict]:
+    start = seg["start"]
+    end = seg["end"] if seg["end"] > seg["start"] else seg["start"] + 0.2
+    text = normalize_caption_text(seg.get("text", ""))
+    parts = split_caption_text(text)
+    if len(parts) <= 1:
+        return [{"start": start, "end": end, "text": text}] if text else []
+
+    total_chars = sum(max(len(part), 1) for part in parts)
+    duration = end - start
+    cursor = start
+    distributed = []
+
+    for i, part in enumerate(parts):
+        if i == len(parts) - 1:
+            part_end = end
+        else:
+            share = max(len(part), 1) / total_chars
+            part_end = cursor + duration * share
+        if part_end <= cursor:
+            part_end = cursor + 0.2
+        distributed.append({"start": cursor, "end": min(part_end, end), "text": part})
+        cursor = distributed[-1]["end"]
+
+    if distributed:
+        distributed[-1]["end"] = max(distributed[-1]["end"], end)
+
+    return distributed
+
+
+def merge_caption_segments(all_segments: list[dict]) -> list[dict]:
+    expanded = []
+    for seg in all_segments:
+        expanded.extend(distribute_segment_text(seg))
+
+    merged = []
+    current = None
+
+    for seg in expanded:
+        text = normalize_caption_text(seg.get("text", ""))
+        if not text:
+            continue
+
+        seg_start = seg["start"]
+        seg_end = seg["end"] if seg["end"] > seg["start"] else seg["start"] + 0.2
+
+        if current is None:
+            current = {"start": seg_start, "end": seg_end, "text": text}
+            continue
+
+        combined_text = f"{current['text']} {text}".strip()
+        combined_duration = seg_end - current["start"]
+        gap = max(0.0, seg_start - current["end"])
+
+        should_merge = (
+            gap <= CAPTION_MAX_GAP_S
+            and combined_duration <= CAPTION_MAX_DURATION_S
+            and len(combined_text) <= CAPTION_MAX_CHARS
+            and len(combined_text.split()) <= CAPTION_MAX_WORDS
+            and (
+                current["end"] - current["start"] < CAPTION_MIN_DURATION_S
+                or not ends_sentence(current["text"])
+            )
+        )
+
+        if should_merge:
+            current["end"] = seg_end
+            current["text"] = combined_text
+        else:
+            merged.append(current)
+            current = {"start": seg_start, "end": seg_end, "text": text}
+
+    if current is not None:
+        merged.append(current)
+
+    return merged
+
+
+def balance_caption_lines(text: str) -> str:
+    text = normalize_caption_text(text)
+    if len(text) <= CAPTION_LINE_CHARS:
+        return text
+
+    words = text.split()
+    best_break = None
+    best_score = None
+
+    for i in range(1, len(words)):
+        left = " ".join(words[:i])
+        right = " ".join(words[i:])
+        longest = max(len(left), len(right))
+        if longest > CAPTION_MAX_CHARS:
+            continue
+        score = abs(len(left) - len(right))
+        if best_score is None or score < best_score:
+            best_score = score
+            best_break = (left, right)
+
+    if best_break is None:
+        return text
+    return f"{best_break[0]}\n{best_break[1]}"
+
+
+def extract_json_array(text: str) -> list | None:
+    text = text.strip()
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, list) else None
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\[[\s\S]*\]", text)
+    if not match:
+        return None
+
+    try:
+        data = json.loads(match.group(0))
+        return data if isinstance(data, list) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def cleanup_segment_batch(
+    client: OpenAI, batch: list[dict], reference_text: str | None = None
+) -> list[dict]:
+    if not batch:
+        return []
+
+    payload = [
+        {"index": i, "text": normalize_caption_text(seg.get("text", ""))}
+        for i, seg in enumerate(batch)
+    ]
+
+    reference_block = (
+        f"\nReference script:\n{reference_text.strip()[:1500]}\n"
+        if reference_text and reference_text.strip()
+        else ""
+    )
+
+    prompt = (
+        "Correct these caption lines from automatic speech recognition.\n"
+        "Fix obvious recognition mistakes, capitalization, and punctuation.\n"
+        "Do not invent words that are not supported by the audio or reference script.\n"
+        "Keep the same number of items and preserve each line's meaning.\n"
+        "Return JSON only as an array of strings in the same order.\n"
+        f"{reference_block}\n"
+        f"Caption lines:\n{json.dumps(payload, ensure_ascii=True)}"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=CAPTION_CLEANUP_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You correct ASR captions conservatively and return valid JSON only.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=1200,
+        )
+        content = (response.choices[0].message.content or "").strip()
+        corrected = extract_json_array(content)
+        if not corrected or len(corrected) != len(batch):
+            logger.warning("cleanup_segment_batch: invalid cleanup response, keeping original text")
+            return batch
+    except Exception as exc:
+        logger.warning("cleanup_segment_batch failed: %s", exc)
+        return batch
+
+    cleaned = []
+    for seg, text in zip(batch, corrected):
+        cleaned.append(
+            {
+                **seg,
+                "text": normalize_caption_text(text if isinstance(text, str) else seg.get("text", "")),
+            }
+        )
+    return cleaned
+
+
+def cleanup_caption_segments(
+    client: OpenAI, segments: list[dict], reference_text: str | None = None
+) -> list[dict]:
+    if not ENABLE_CAPTION_CLEANUP or not segments:
+        return segments
+
+    cleaned = []
+    batch = []
+    batch_chars = 0
+
+    for seg in segments:
+        text = normalize_caption_text(seg.get("text", ""))
+        if not text:
+            cleaned.append(seg)
+            continue
+
+        batch.append(seg)
+        batch_chars += len(text)
+        if len(batch) >= CAPTION_CLEANUP_BATCH_SIZE or batch_chars >= CAPTION_CLEANUP_BATCH_CHARS:
+            cleaned.extend(cleanup_segment_batch(client, batch, reference_text=reference_text))
+            batch = []
+            batch_chars = 0
+
+    if batch:
+        cleaned.extend(cleanup_segment_batch(client, batch, reference_text=reference_text))
+
+    return cleaned
+
+
+def apply_cleaned_segment_text_to_words(
+    words: list[dict], original_segments: list[dict], cleaned_segments: list[dict]
+) -> list[dict]:
+    updated_words = [w.copy() for w in words]
+    if len(original_segments) != len(cleaned_segments):
+        return updated_words
+
+    for original, cleaned in zip(original_segments, cleaned_segments):
+        seg_words = [
+            w for w in updated_words
+            if w["start"] >= original["start"] - 0.05 and w["start"] < original["end"] + 0.05
+        ]
+        cleaned_tokens = normalize_caption_text(cleaned.get("text", "")).split()
+        if seg_words and len(seg_words) == len(cleaned_tokens):
+            for word, token in zip(seg_words, cleaned_tokens):
+                word["word"] = token
+
+    return updated_words
+
+
+def split_words_into_highlight_windows(seg_words: list[dict]) -> list[list[dict]]:
+    windows = []
+    current: list[dict] = []
+
+    for word in seg_words:
+        token = word["word"].strip()
+        if not token:
+            continue
+
+        candidate = current + [word]
+        candidate_text = " ".join(w["word"].strip() for w in candidate if w["word"].strip())
+        gap = 0.0
+        if current:
+            gap = max(0.0, word["start"] - current[-1]["end"])
+
+        should_split = (
+            bool(current)
+            and (
+                len(candidate_text) > HIGHLIGHT_MAX_CHARS
+                or len(candidate) > HIGHLIGHT_MAX_WORDS
+                or gap > HIGHLIGHT_MAX_GAP_S
+            )
+        )
+
+        if should_split:
+            windows.append(current)
+            current = [word]
+        else:
+            current = candidate
+
+        current_text = " ".join(w["word"].strip() for w in current if w["word"].strip())
+        if len(current_text) >= 30 and ends_sentence(current_text):
+            windows.append(current)
+            current = []
+
+    if current:
+        windows.append(current)
+
+    return [window for window in windows if window]
+
+
+def build_highlight_window_text(window_words: list[dict], active_index: int) -> str:
+    parts = []
+    for i, word in enumerate(window_words):
+        text = word["word"].strip()
+        if not text:
+            continue
+        if i == active_index:
+            parts.append(f"<v>{text}</v>")
+        else:
+            parts.append(text)
+    return " ".join(parts)
+
+
+def build_highlight_vtt(all_words: list[dict], all_segments: list[dict]) -> str:
     if not all_words and not all_segments:
         return "WEBVTT\nKind: captions\nLanguage: en\n\n"
 
     lines = ["WEBVTT", "Kind: captions", "Language: en", ""]
+    last_cue_end = 0.0
 
     for seg in all_segments:
-        # Match words by start time falling within the segment — more robust than
-        # filtering by end time, which Whisper sometimes places outside segment bounds.
         seg_words = [
             w for w in all_words
             if w["start"] >= seg["start"] - 0.05 and w["start"] < seg["end"] + 0.05
         ]
         if not seg_words:
-            # Whisper didn't return word-level timestamps for this segment.
-            # Emit a plain cue using segment boundaries so no content is lost.
             seg_start = seg["start"]
-            seg_end = seg["end"] if seg["end"] > seg["start"] else seg["start"] + 0.05
+            seg_end = seg["end"] if seg["end"] > seg["start"] else seg["start"] + MIN_VALID_CUE_DURATION_S
             lines.append(f"{fmt_ts(seg_start)} --> {fmt_ts(seg_end)}")
-            lines.append(seg["text"].strip())
+            lines.append(normalize_caption_text(seg.get("text", "")))
             lines.append("")
             continue
 
-        for i, word in enumerate(seg_words):
-            cue_start = word["start"]
-            # Stretch each word's cue to the next word's start so there are no
-            # gaps where the subtitle disappears mid-sentence.
-            if i + 1 < len(seg_words):
-                cue_end = seg_words[i + 1]["start"]
-            else:
-                cue_end = max(word["end"], seg["end"])
-
-            # Guard against zero-duration or negative cues.
-            if cue_end <= cue_start:
-                cue_end = cue_start + 0.05
-
-            parts = []
-            for j, w in enumerate(seg_words):
-                txt = w["word"].strip()
-                if j == i:
-                    parts.append(f"<v>{txt}</v>")
+        for window in split_words_into_highlight_windows(seg_words):
+            for i, word in enumerate(window):
+                cue_start = max(word["start"], last_cue_end)
+                if i + 1 < len(window):
+                    cue_end = max(window[i + 1]["start"], cue_start + MIN_VALID_CUE_DURATION_S)
                 else:
-                    parts.append(txt)
+                    cue_end = max(word["end"], seg["end"], cue_start + MIN_VALID_CUE_DURATION_S)
+                if cue_end <= cue_start:
+                    cue_end = cue_start + MIN_VALID_CUE_DURATION_S
 
-            lines.append(f"{fmt_ts(cue_start)} --> {fmt_ts(cue_end)}")
-            lines.append(" ".join(parts))
-            lines.append("")
+                lines.append(f"{fmt_ts(cue_start)} --> {fmt_ts(cue_end)}")
+                lines.append(build_highlight_window_text(window, i))
+                lines.append("")
+                last_cue_end = cue_end
 
     return "\n".join(lines)
 
 
-def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
-    client = OpenAI()
-    audio_orig = AudioSegment.from_file(file_path)
+def build_caption_vtt(all_segments) -> str:
+    if not all_segments:
+        return "WEBVTT\nKind: captions\nLanguage: en\n\n"
+
+    lines = ["WEBVTT", "Kind: captions", "Language: en", ""]
+
+    for cue in merge_caption_segments(all_segments):
+        lines.append(f"{fmt_ts(cue['start'])} --> {fmt_ts(cue['end'])}")
+        lines.append(balance_caption_lines(cue["text"]))
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def validate_segments_for_vtt(segments: list[dict], audio_duration_s: float) -> tuple[bool, str]:
+    if not segments:
+        return False, "No speech segments were returned."
+
+    text_chars = 0
+    valid_ranges = 0
+    prev_start = -1.0
+
+    for seg in segments:
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", start))
+        text = normalize_caption_text(seg.get("text", ""))
+
+        if start < prev_start - 0.1:
+            return False, "Segment timings are out of order."
+        prev_start = start
+
+        if text:
+            text_chars += len(text)
+        if end > start:
+            valid_ranges += 1
+
+    if valid_ranges == 0:
+        return False, "All returned segments had empty timing ranges."
+    if text_chars < MIN_VALID_TEXT_CHARS and audio_duration_s >= 3:
+        return False, "Transcript text was too short to trust."
+
+    return True, "ok"
+
+
+def parse_vtt_cues(vtt_text: str) -> list[tuple[float, float, str]]:
+    cues = []
+    blocks = re.split(r"\n\s*\n", vtt_text.strip())
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines or lines[0] == "WEBVTT" or lines[0].startswith("Kind:") or lines[0].startswith("Language:"):
+            continue
+
+        time_index = None
+        for i, line in enumerate(lines):
+            if "-->" in line:
+                time_index = i
+                break
+        if time_index is None:
+            continue
+
+        match = re.match(
+            r"(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s+-->\s+(\d{2}):(\d{2}):(\d{2})\.(\d{3})",
+            lines[time_index],
+        )
+        if not match:
+            continue
+
+        h1, m1, s1, ms1, h2, m2, s2, ms2 = map(int, match.groups())
+        start = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000
+        end = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000
+        text = " ".join(lines[time_index + 1:]).strip()
+        cues.append((start, end, text))
+
+    return cues
+
+
+def validate_vtt_output(vtt_text: str, audio_duration_s: float) -> tuple[bool, str]:
+    if not vtt_text.startswith("WEBVTT"):
+        return False, "VTT header missing."
+
+    cues = parse_vtt_cues(vtt_text)
+    if not cues:
+        return False, "No VTT cues were generated."
+
+    total_text_chars = 0
+    prev_end = 0.0
+
+    for start, end, text in cues:
+        if end <= start:
+            return False, "Cue timing was zero or negative."
+        if end - start < MIN_VALID_CUE_DURATION_S:
+            return False, "Cue timing was too short."
+        if start + 0.1 < prev_end:
+            return False, "Cue timings overlap out of order."
+        prev_end = end
+        total_text_chars += len(normalize_caption_text(text))
+
+    if total_text_chars < MIN_VALID_TEXT_CHARS and audio_duration_s >= 3:
+        return False, "VTT text output was too short."
+
+    return True, "ok"
+
+
+def collect_transcription_data(
+    client: OpenAI, audio_orig: AudioSegment, vo_prompt: str | None = None
+) -> tuple[list[dict], list[dict]]:
 
     # Prepend 1 s of silence so Whisper "warms up" before speech starts;
     # subtract that offset from all returned timestamps.
@@ -659,15 +1111,11 @@ def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
             for s in getattr(result, "segments", None) or []:
                 segments.append({"start": max(0.0, s.start + offset_s), "end": max(0.0, s.end + offset_s), "text": s.text})
 
-    # If the opening phrase is absent, run a targeted second pass on the first
-    # 15 seconds with a strong prompt and a longer warmup pad.
     if not _has_riptoes_opening(segments):
         logger.info("transcribe_file: opening phrase missing, running targeted pass")
         opening = _targeted_opening_pass(client, audio_orig)
         if opening:
             o_words, o_segs = opening
-            # Use the targeted-pass results for the first 10 s; keep the main
-            # transcription for everything after that to avoid duplicates.
             OPENING_WINDOW_S = 10.0
             segments = sorted(
                 [s for s in o_segs if s["start"] < OPENING_WINDOW_S]
@@ -680,11 +1128,78 @@ def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
                 key=lambda w: w["start"],
             )
         else:
-            # Both passes failed — inject a synthetic segment as a last resort.
             words, segments = ensure_riptoes_opening(words, segments)
 
-    words = apply_context_corrections(words, segments)
-    return build_word_highlight_vtt(words, segments)
+    return words, segments
+
+
+def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
+    client = OpenAI()
+    audio_orig = AudioSegment.from_file(file_path)
+    audio_duration_s = len(audio_orig) / 1000.0
+    last_error: Exception | None = None
+
+    for attempt in range(1, TRANSCRIPTION_MAX_ATTEMPTS + 1):
+        try:
+            words, segments = collect_transcription_data(client, audio_orig, vo_prompt=vo_prompt)
+            words = apply_context_corrections(words, segments)
+            raw_words = [
+                {
+                    "word": normalize_caption_text(word.get("word", "")),
+                    "start": max(0.0, float(word["start"])),
+                    "end": max(float(word["end"]), float(word["start"]) + MIN_VALID_CUE_DURATION_S),
+                }
+                for word in words
+                if normalize_caption_text(word.get("word", ""))
+            ]
+            raw_segments = [
+                {
+                    "start": max(0.0, float(seg["start"])),
+                    "end": max(float(seg["end"]), float(seg["start"]) + MIN_VALID_CUE_DURATION_S),
+                    "text": normalize_caption_text(seg.get("text", "")),
+                }
+                for seg in segments
+                if normalize_caption_text(seg.get("text", ""))
+            ]
+
+            ok, message = validate_segments_for_vtt(raw_segments, audio_duration_s)
+            if not ok:
+                raise ValueError(message)
+
+            spellchecked_segments = cleanup_caption_segments(client, raw_segments, reference_text=vo_prompt)
+            spellchecked_words = apply_cleaned_segment_text_to_words(raw_words, raw_segments, spellchecked_segments)
+            candidates = [
+                ("spellchecked", spellchecked_words, spellchecked_segments),
+                ("raw", raw_words, raw_segments),
+            ]
+
+            for label, candidate_words, candidate_segments in candidates:
+                renderers = []
+                if candidate_words:
+                    renderers.append(("highlight", build_highlight_vtt(candidate_words, candidate_segments)))
+                renderers.append(("plain", build_caption_vtt(candidate_segments)))
+
+                for render_label, vtt_text in renderers:
+                    valid_vtt, vtt_message = validate_vtt_output(vtt_text, audio_duration_s)
+                    if valid_vtt:
+                        logger.info("transcribe_file: attempt %s accepted %s %s VTT", attempt, label, render_label)
+                        return vtt_text
+                    logger.warning(
+                        "transcribe_file: attempt %s rejected %s %s VTT: %s",
+                        attempt,
+                        label,
+                        render_label,
+                        vtt_message,
+                    )
+
+            raise ValueError("Generated VTT failed validation.")
+        except Exception as exc:
+            last_error = exc
+            logger.warning("transcribe_file: attempt %s/%s failed: %s", attempt, TRANSCRIPTION_MAX_ATTEMPTS, exc)
+
+    raise RuntimeError(
+        f"Transcription failed after {TRANSCRIPTION_MAX_ATTEMPTS} attempts: {last_error}"
+    )
 
 
 CONTENT_TYPE_SUFFIX = {
@@ -738,6 +1253,39 @@ def download_url_to_temp(url: str) -> tuple[str, str, int]:
     return tmp.name, filename, size
 
 
+def process_media_file(
+    file_path: str,
+    filename: str,
+    file_size: int,
+    ip: str | None,
+) -> dict:
+    stem = Path(filename).stem
+    video_id = extract_video_id(filename)
+    airtable = fetch_airtable_record(video_id) if video_id is not None else None
+    record_id, topic, storyboard_url = airtable if airtable else (None, stem, "")
+    vo_prompt = fetch_storyboard_vo(storyboard_url)
+
+    vtt_text = transcribe_file(file_path, vo_prompt=vo_prompt)
+
+    transcription_id = save_transcription(filename, file_size, vtt_text, ip)
+    save_to_upload_folder(filename, vtt_text)
+    generate_thumbnail(file_path, stem)
+    update_upload_date(record_id)
+
+    master_row = fetch_master_sheet_row(video_id) if video_id is not None else None
+    if master_row:
+        master_row = sel_check_and_rewrite(master_row)
+        write_to_upload_sheet(master_row)
+
+    return {
+        "filename": filename,
+        "stem": stem,
+        "vtt_text": vtt_text,
+        "transcription_id": transcription_id,
+        "thumbnail_url": f"/thumbnail/{stem}" if get_thumbnail_path(stem) else None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # HTML pages
 # ---------------------------------------------------------------------------
@@ -784,6 +1332,9 @@ HTML_PAGE = """
   .status.success a { color: #4a9eff; text-decoration: none; font-weight: 600; }
 
   .batch-log { margin-top: 1rem; font-size: 0.85rem; max-height: 300px; overflow-y: auto; }
+  .batch-section { margin-bottom: 1.25rem; }
+  .batch-section h3 { font-size: 0.95rem; margin-bottom: 0.5rem; color: #ccc; }
+  .batch-hint { color: #777; font-size: 0.8rem; margin-bottom: 0.75rem; }
   .batch-item { padding: 0.5rem 0; border-bottom: 1px solid #222; display: flex; justify-content: space-between; align-items: center; }
   .batch-item .name { color: #ccc; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 0.5rem; }
   .batch-item .state { font-size: 0.8rem; white-space: nowrap; }
@@ -802,7 +1353,7 @@ HTML_PAGE = """
 <body>
 <div class="container">
   <h1>VTT Generator</h1>
-  <p class="sub">Generate word-highlighted subtitle files (.vtt)</p>
+  <p class="sub">Generate cleaner subtitle files (.vtt) with steadier cue timing</p>
 
   <div class="tabs">
     <div class="tab active" data-tab="file">File Upload</div>
@@ -834,10 +1385,27 @@ HTML_PAGE = """
 
   <!-- Batch tab -->
   <div class="tab-content" id="tab-batch">
-    <form id="batch-form">
-      <textarea id="batch-input" placeholder="Paste URLs, one per line"></textarea>
-      <button type="submit" id="batch-btn">Process All</button>
-    </form>
+    <div class="batch-section">
+      <h3>Batch Upload</h3>
+      <p class="batch-hint">Select several video or audio files and process them one after another.</p>
+      <form id="batch-upload-form">
+        <label class="file-label" id="batch-drop-label" for="batch-file-input">
+          <span id="batch-label-text">Click to select or drag multiple files here</span>
+          <div class="file-name" id="batch-file-name"></div>
+          <input type="file" id="batch-file-input" multiple accept="video/*,audio/*,.mp3,.mp4,.m4a,.wav,.webm,.ogg,.flac,.mpeg,.mpga">
+        </label>
+        <button type="submit" id="batch-upload-btn" disabled>Process Uploaded Files</button>
+      </form>
+    </div>
+
+    <div class="batch-section">
+      <h3>Batch URLs</h3>
+      <p class="batch-hint">Paste direct media URLs, one per line.</p>
+      <form id="batch-form">
+        <textarea id="batch-input" placeholder="Paste URLs, one per line"></textarea>
+        <button type="submit" id="batch-btn">Process URL List</button>
+      </form>
+    </div>
     <div class="batch-log" id="batch-log"></div>
   </div>
 
@@ -946,49 +1514,133 @@ HTML_PAGE = """
   const batchInput = document.getElementById('batch-input');
   const batchBtn = document.getElementById('batch-btn');
   const batchLog = document.getElementById('batch-log');
+  const batchUploadForm = document.getElementById('batch-upload-form');
+  const batchFileInput = document.getElementById('batch-file-input');
+  const batchFileNameEl = document.getElementById('batch-file-name');
+  const batchDropLabel = document.getElementById('batch-drop-label');
+  const batchUploadBtn = document.getElementById('batch-upload-btn');
+
+  function formatFilesSummary(files) {
+    const totalMb = Array.from(files).reduce((sum, f) => sum + f.size, 0) / 1024 / 1024;
+    return files.length + ' files (' + totalMb.toFixed(1) + ' MB)';
+  }
+
+  function renderBatchItems(items) {
+    batchLog.innerHTML = '';
+    items.forEach((item, i) => {
+      const div = document.createElement('div');
+      div.className = 'batch-item';
+      div.innerHTML = '<span class="name" title="' + item.title + '">' + item.name + '</span><span class="state queued" id="bs-' + i + '">queued</span>';
+      batchLog.appendChild(div);
+    });
+  }
+
+  function updateBatchState(index, status, html) {
+    const el = document.getElementById('bs-' + index);
+    if (!el) return;
+    el.className = 'state ' + status;
+    if (html !== undefined) el.innerHTML = html;
+  }
+
+  function setBatchFiles(files) {
+    batchFileInput.files = files;
+    batchFileNameEl.textContent = files.length ? formatFilesSummary(files) : '';
+    batchDropLabel.classList.toggle('has-file', files.length > 0);
+    batchUploadBtn.disabled = files.length === 0;
+  }
+
+  batchFileInput.addEventListener('change', () => {
+    setBatchFiles(batchFileInput.files);
+  });
+
+  batchDropLabel.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); batchDropLabel.classList.add('dragover'); });
+  batchDropLabel.addEventListener('dragleave', (e) => { e.preventDefault(); e.stopPropagation(); batchDropLabel.classList.remove('dragover'); });
+  batchDropLabel.addEventListener('drop', (e) => {
+    e.preventDefault(); e.stopPropagation(); batchDropLabel.classList.remove('dragover');
+    if (!e.dataTransfer.files.length) return;
+    const dt = new DataTransfer();
+    Array.from(e.dataTransfer.files).forEach(file => dt.items.add(file));
+    setBatchFiles(dt.files);
+  });
+
+  batchUploadForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const files = Array.from(batchFileInput.files || []);
+    if (!files.length) return;
+
+    batchUploadBtn.disabled = true;
+    batchBtn.disabled = true;
+
+    const items = files.map(file => ({ name: file.name, title: file.name }));
+    renderBatchItems(items);
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      updateBatchState(i, 'transcribing', 'uploading…');
+      try {
+        const fd = new FormData();
+        fd.append('file', file);
+        const res = await fetch('/transcribe', { method: 'POST', body: fd });
+        if (!res.ok) {
+          let message = 'Transcription failed';
+          try {
+            const err = await res.json();
+            message = err.detail || message;
+          } catch (_) {}
+          throw new Error(message);
+        }
+        const blob = await res.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        const name = file.name.replace(/\\.[^.]+$/, '') + '.vtt';
+        const thumbUrl = res.headers.get('X-Thumbnail-URL');
+        const links = '<a href="' + blobUrl + '" download="' + name + '">download VTT</a>'
+          + (thumbUrl ? ' <a href="' + thumbUrl + '" download>thumbnail</a>' : '');
+        updateBatchState(i, 'done', 'done ' + links);
+      } catch (err) {
+        updateBatchState(i, 'error', (err && err.message) ? err.message : 'error');
+      }
+    }
+
+    batchUploadBtn.disabled = false;
+    batchBtn.disabled = false;
+  });
 
   batchForm.addEventListener('submit', (e) => {
     e.preventDefault();
     const urls = batchInput.value.trim().split('\\n').map(u => u.trim()).filter(Boolean);
     if (!urls.length) return;
     batchBtn.disabled = true;
-    batchLog.innerHTML = '';
+    batchUploadBtn.disabled = true;
 
     // Build item rows
     const items = {};
+    renderBatchItems(urls.map((url, i) => ({
+      name: url.split('/').pop().split('?')[0] || ('file-' + (i+1)),
+      title: url
+    })));
     urls.forEach((url, i) => {
-      const name = url.split('/').pop().split('?')[0] || ('file-' + (i+1));
-      const div = document.createElement('div');
-      div.className = 'batch-item';
-      div.innerHTML = '<span class="name" title="' + url + '">' + name + '</span><span class="state queued" id="bs-' + i + '">queued</span>';
-      batchLog.appendChild(div);
-      items[i] = { url, name, el: div };
+      items[i] = { url };
     });
 
     const es = new EventSource('/batch?urls=' + encodeURIComponent(JSON.stringify(urls)));
     es.onmessage = (evt) => {
       const d = JSON.parse(evt.data);
-      const stateEl = document.getElementById('bs-' + d.index);
-      if (!stateEl) return;
-      const item = items[d.index];
       if (d.status === 'downloading') {
-        stateEl.className = 'state downloading';
-        stateEl.textContent = 'downloading…';
+        updateBatchState(d.index, 'downloading', 'downloading…');
       } else if (d.status === 'transcribing') {
-        stateEl.className = 'state transcribing';
-        stateEl.textContent = 'transcribing…';
+        updateBatchState(d.index, 'transcribing', 'transcribing…');
       } else if (d.status === 'done') {
-        stateEl.className = 'state done';
-        stateEl.innerHTML = 'done <a href="/download/' + d.id + '">download</a>';
+        const link = d.id ? 'done <a href="/download/' + d.id + '">download</a>' : 'done';
+        updateBatchState(d.index, 'done', link);
       } else if (d.status === 'error') {
-        stateEl.className = 'state error';
-        stateEl.textContent = d.message || 'error';
+        updateBatchState(d.index, 'error', d.message || 'error');
       } else if (d.status === 'complete') {
         es.close();
         batchBtn.disabled = false;
+        batchUploadBtn.disabled = batchFileInput.files.length === 0;
       }
     };
-    es.onerror = () => { es.close(); batchBtn.disabled = false; };
+    es.onerror = () => { es.close(); batchBtn.disabled = false; batchUploadBtn.disabled = batchFileInput.files.length === 0; };
   });
 </script>
 </body>
@@ -1039,46 +1691,32 @@ async def index():
 
 @app.post("/transcribe")
 async def transcribe(request: Request, file: UploadFile = File(...)):
+    require_openai_api_key()
     contents = await file.read()
     if len(contents) > MAX_UPLOAD_SIZE:
         raise HTTPException(status_code=413, detail="File exceeds 500 MB limit.")
 
     original_name = file.filename or "unknown"
-    stem = Path(original_name).stem
-    video_id = extract_video_id(original_name)
-    airtable = fetch_airtable_record(video_id) if video_id is not None else None
-    record_id, topic, storyboard_url = airtable if airtable else (None, stem, "")
-    vo_prompt = fetch_storyboard_vo(storyboard_url)
-
     suffix = Path(file.filename).suffix if file.filename else ".mp4"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
         tmp.write(contents)
         tmp.close()
-
-        vtt_text = transcribe_file(tmp.name, vo_prompt=vo_prompt)
-
         ip = request.client.host if request.client else None
-        save_transcription(original_name, len(contents), vtt_text, ip)
-        save_to_upload_folder(original_name, vtt_text)
-        generate_thumbnail(tmp.name, stem)
-        update_upload_date(record_id)
-        master_row = fetch_master_sheet_row(video_id) if video_id is not None else None
-        if master_row:
-            master_row = sel_check_and_rewrite(master_row)
-            write_to_upload_sheet(master_row)
+        result = process_media_file(tmp.name, original_name, len(contents), ip)
 
-        out_name = stem + ".vtt"
+        out_name = Path(original_name).stem + ".vtt"
         resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
-        if get_thumbnail_path(stem):
-            resp_headers["X-Thumbnail-URL"] = f"/thumbnail/{stem}"
-        return Response(content=vtt_text, media_type="text/vtt", headers=resp_headers)
+        if result["thumbnail_url"]:
+            resp_headers["X-Thumbnail-URL"] = result["thumbnail_url"]
+        return Response(content=result["vtt_text"], media_type="text/vtt", headers=resp_headers)
     finally:
         os.unlink(tmp.name)
 
 
 @app.post("/transcribe-url")
 async def transcribe_url(request: Request, url: str = Form(...)):
+    require_openai_api_key()
     try:
         file_path, filename, file_size = download_url_to_temp(url)
     except httpx.HTTPStatusError as exc:
@@ -1086,30 +1724,15 @@ async def transcribe_url(request: Request, url: str = Form(...)):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Download failed: {exc}")
 
-    stem = Path(filename).stem
-    video_id = extract_video_id(filename)
-    airtable = fetch_airtable_record(video_id) if video_id is not None else None
-    record_id, topic, storyboard_url = airtable if airtable else (None, stem, "")
-    vo_prompt = fetch_storyboard_vo(storyboard_url)
-
     try:
-        vtt_text = transcribe_file(file_path, vo_prompt=vo_prompt)
-
         ip = request.client.host if request.client else None
-        save_transcription(filename, file_size, vtt_text, ip)
-        save_to_upload_folder(filename, vtt_text)
-        generate_thumbnail(file_path, stem)
-        update_upload_date(record_id)
-        master_row = fetch_master_sheet_row(video_id) if video_id is not None else None
-        if master_row:
-            master_row = sel_check_and_rewrite(master_row)
-            write_to_upload_sheet(master_row)
+        result = process_media_file(file_path, filename, file_size, ip)
 
-        out_name = stem + ".vtt"
+        out_name = Path(filename).stem + ".vtt"
         resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
-        if get_thumbnail_path(stem):
-            resp_headers["X-Thumbnail-URL"] = f"/thumbnail/{stem}"
-        return Response(content=vtt_text, media_type="text/vtt", headers=resp_headers)
+        if result["thumbnail_url"]:
+            resp_headers["X-Thumbnail-URL"] = result["thumbnail_url"]
+        return Response(content=result["vtt_text"], media_type="text/vtt", headers=resp_headers)
     finally:
         os.unlink(file_path)
 
@@ -1117,6 +1740,7 @@ async def transcribe_url(request: Request, url: str = Form(...)):
 @app.get("/batch")
 async def batch(request: Request, urls: str):
     """SSE endpoint: processes a list of URLs and streams progress events."""
+    require_openai_api_key()
     try:
         url_list = json.loads(urls)
     except json.JSONDecodeError:
@@ -1141,21 +1765,8 @@ async def batch(request: Request, urls: str):
 
             try:
                 yield f"data: {json.dumps({'index': i, 'status': 'transcribing'})}\n\n"
-                fstem = Path(filename).stem
-                vid = extract_video_id(filename)
-                at = fetch_airtable_record(vid) if vid is not None else None
-                b_record_id, b_topic, b_storyboard = at if at else (None, fstem, "")
-                vo_prompt = fetch_storyboard_vo(b_storyboard)
-                vtt_text = transcribe_file(file_path, vo_prompt=vo_prompt)
-                tid = save_transcription(filename, file_size, vtt_text, ip)
-                save_to_upload_folder(filename, vtt_text)
-                generate_thumbnail(file_path, fstem)
-                update_upload_date(b_record_id)
-                b_master = fetch_master_sheet_row(vid) if vid is not None else None
-                if b_master:
-                    b_master = sel_check_and_rewrite(b_master)
-                    write_to_upload_sheet(b_master)
-                yield f"data: {json.dumps({'index': i, 'status': 'done', 'id': tid})}\n\n"
+                result = process_media_file(file_path, filename, file_size, ip)
+                yield f"data: {json.dumps({'index': i, 'status': 'done', 'id': result['transcription_id']})}\n\n"
             except Exception as exc:
                 yield f"data: {json.dumps({'index': i, 'status': 'error', 'message': f'Transcription failed: {exc}'})}\n\n"
             finally:
