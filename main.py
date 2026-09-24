@@ -668,8 +668,8 @@ HTML_PAGE = """
 <title>VTT Generator</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: system-ui, sans-serif; background: #0f0f0f; color: #e0e0e0; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
-  .container { background: #1a1a1a; border-radius: 12px; padding: 2.5rem; max-width: 520px; width: 90%; box-shadow: 0 4px 24px rgba(0,0,0,0.4); }
+  body { font-family: system-ui, sans-serif; background: #0f0f0f; color: #e0e0e0; display: flex; justify-content: center; align-items: flex-start; min-height: 100vh; padding: 2rem 1rem; }
+  .container { background: #1a1a1a; border-radius: 12px; padding: 2.5rem; max-width: 1800px; width: min(96vw, 1800px); box-shadow: 0 4px 24px rgba(0,0,0,0.4); }
   h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
   p.sub { color: #888; margin-bottom: 1.5rem; font-size: 0.9rem; }
 
@@ -699,7 +699,7 @@ HTML_PAGE = """
   .status { margin-top: 1rem; font-size: 0.9rem; text-align: center; }
   .status.error { color: #ff6b6b; }
   .status.success a { color: #4a9eff; text-decoration: none; font-weight: 600; }
-  .results-table { width: 100%; margin-top: 1rem; border-collapse: collapse; text-align: left; font-size: 0.8rem; }
+  .results-table { width: 100%; min-width: 1320px; margin-top: 1rem; border-collapse: collapse; text-align: left; font-size: 0.8rem; }
   .results-wrap { width: 100%; overflow-x: auto; }
   .results-table th { color: #888; font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; padding: .55rem .45rem; border-bottom: 1px solid #333; }
   .results-table td { padding: .7rem .45rem; border-bottom: 1px solid #292929; vertical-align: top; }
@@ -732,8 +732,14 @@ HTML_PAGE = """
   .vtt-toolbar { display: flex; align-items: center; gap: .65rem; }
   .vtt-toolbar button { width: auto; padding: .4rem .7rem; font-size: .78rem; }
   .vtt-dirty { color: #ffd27a; font-size: .72rem; }
-  .validation-detail { max-height: 500px; overflow: auto; padding-right: .25rem; }
-  .line-diff { min-width: 620px; }
+  .validation-detail { max-height: 620px; overflow: auto; padding-right: .25rem; }
+  .validation-detail details { display: block; }
+  .line-diff { min-width: 700px; }
+  .line-diff thead th { position: sticky; top: 0; z-index: 1; background: #1a1a1a; }
+  @media (max-width: 900px) {
+    body { padding: .5rem; }
+    .container { width: 100%; padding: 1rem; }
+  }
 
   .batch-log { margin-top: 1rem; font-size: 0.85rem; max-height: 300px; overflow-y: auto; }
   .batch-section { margin-bottom: 1.25rem; }
@@ -882,7 +888,10 @@ HTML_PAGE = """
       validationCell.appendChild(detail);
       if (storyboard.lines && storyboard.lines.length) {
         const details = document.createElement('details');
-        details.open = storyboard.status === 'review';
+        // Keep the storyboard/audio comparison visible while reviewing a batch;
+        // the validation pane has its own scroll region so it does not stretch
+        // the whole results page.
+        details.open = true;
         const summary = document.createElement('summary'); summary.textContent = 'Shot-by-shot audio comparison'; details.appendChild(summary);
         const table = document.createElement('table'); table.className = 'line-diff';
         table.innerHTML = '<thead><tr><th>Shot</th><th>Storyboard VO</th><th>Audio (dialogue)</th><th>Status</th></tr></thead>';
