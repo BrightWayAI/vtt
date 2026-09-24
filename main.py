@@ -658,6 +658,12 @@ HTML_PAGE = """
   .validation-detail details { margin-top: .35rem; }
   .validation-detail summary { color: #bbb; cursor: pointer; }
   .validation-detail .diff { margin-top: .25rem; padding: .35rem; background: #111; border-radius: 4px; }
+  .line-diff { width: 100%; margin-top: .5rem; border-collapse: collapse; font-size: .75rem; }
+  .line-diff th, .line-diff td { padding: .35rem; border: 1px solid #292929; vertical-align: top; text-align: left; }
+  .line-diff th { color: #888; font-weight: 600; }
+  .line-diff .line-number { color: #666; width: 2rem; }
+  .diff-missing { color: #ff9b9b; background: rgba(210, 70, 70, .18); text-decoration: line-through; }
+  .diff-extra { color: #ffd27a; background: rgba(230, 160, 40, .18); }
 
   .batch-log { margin-top: 1rem; font-size: 0.85rem; max-height: 300px; overflow-y: auto; }
   .batch-section { margin-bottom: 1.25rem; }
@@ -803,14 +809,27 @@ HTML_PAGE = """
       detail.textContent = (storyboard.message || 'Validation completed.') +
         (readabilityIssues ? ' Readability needs review.' : ' Readability passed.');
       validationCell.appendChild(detail);
-      if (storyboard.examples && storyboard.examples.length) {
+      if (storyboard.lines && storyboard.lines.length) {
         const details = document.createElement('details');
-        const summary = document.createElement('summary'); summary.textContent = 'Show differences'; details.appendChild(summary);
-        storyboard.examples.forEach(example => {
-          const diff = document.createElement('div'); diff.className = 'diff';
-          diff.textContent = 'Storyboard: ' + example.storyboard + ' / Audio: ' + example.audio;
-          details.appendChild(diff);
+        details.open = storyboard.status === 'review';
+        const summary = document.createElement('summary'); summary.textContent = 'Line-by-line comparison'; details.appendChild(summary);
+        const table = document.createElement('table'); table.className = 'line-diff';
+        table.innerHTML = '<thead><tr><th>#</th><th>Storyboard VO</th><th>Transcript</th></tr></thead>';
+        const body = document.createElement('tbody'); table.appendChild(body);
+        const addParts = (cell, parts) => parts.forEach(part => {
+          const span = document.createElement('span');
+          if (part.kind !== 'same') span.className = part.kind === 'missing' ? 'diff-missing' : 'diff-extra';
+          span.textContent = part.text + ' ';
+          cell.appendChild(span);
         });
+        storyboard.lines.forEach(line => {
+          const row = document.createElement('tr');
+          const number = document.createElement('td'); number.className = 'line-number'; number.textContent = line.line;
+          const storyboardCell = document.createElement('td'); addParts(storyboardCell, line.storyboard_parts || []);
+          const transcriptCell = document.createElement('td'); addParts(transcriptCell, line.transcript_parts || []);
+          row.append(number, storyboardCell, transcriptCell); body.appendChild(row);
+        });
+        details.appendChild(table);
         validationCell.appendChild(details);
       }
     }
