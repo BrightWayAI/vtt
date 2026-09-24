@@ -6,6 +6,7 @@ import re
 import secrets
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -66,6 +67,14 @@ def store_validation_report(report: dict) -> str:
     key = secrets.token_urlsafe(18)
     VALIDATION_REPORTS[key] = (now, report)
     return key
+
+
+def safe_download_filename(filename: str, fallback: str = "subtitles.vtt") -> str:
+    """Build an ASCII-safe Content-Disposition filename."""
+    name = unicodedata.normalize("NFKD", filename or "")
+    name = name.encode("ascii", "ignore").decode("ascii")
+    name = re.sub(r"[\r\n\\/\"]", "_", name).strip()
+    return name or fallback
 
 
 def extract_video_id(filename: str) -> int | None:
@@ -502,16 +511,16 @@ def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
             raw_words = [
                 {
                     "word": normalize_caption_text(word.get("word", "")),
-                    "start": max(0.0, float(word["start"])),
-                    "end": max(float(word["end"]), float(word["start"]) + MIN_VALID_CUE_DURATION_S),
+                    "start": min(audio_duration_s, max(0.0, float(word["start"]))),
+                    "end": min(audio_duration_s, max(float(word["end"]), float(word["start"]) + MIN_VALID_CUE_DURATION_S)),
                 }
                 for word in words
                 if normalize_caption_text(word.get("word", ""))
             ]
             raw_segments = [
                 {
-                    "start": max(0.0, float(seg["start"])),
-                    "end": max(float(seg["end"]), float(seg["start"]) + MIN_VALID_CUE_DURATION_S),
+                    "start": min(audio_duration_s, max(0.0, float(seg["start"]))),
+                    "end": min(audio_duration_s, max(float(seg["end"]), float(seg["start"]) + MIN_VALID_CUE_DURATION_S)),
                     "text": normalize_caption_text(seg.get("text", "")),
                 }
                 for seg in segments
@@ -1140,9 +1149,9 @@ async def transcribe(request: Request, file: UploadFile = File(...)):
         ip = request.client.host if request.client else None
         result = await run_in_threadpool(process_media_file, tmp.name, original_name, file_size, ip)
 
-        out_name = Path(original_name).stem + ".vtt"
+        out_name = safe_download_filename(Path(original_name).stem + ".vtt")
         resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
-        resp_headers["X-Validation-Summary"] = result.get("validation", "")
+        resp_headers["X-Validation-Summary"] = result.get("validation", "").encode("ascii", "ignore").decode("ascii")
         resp_headers["X-Validation-ID"] = result.get("validation_id", "")
         return Response(content=result["vtt_text"], media_type="text/vtt", headers=resp_headers)
     finally:
@@ -1163,9 +1172,9 @@ async def transcribe_url(request: Request, url: str = Form(...)):
         ip = request.client.host if request.client else None
         result = await run_in_threadpool(process_media_file, file_path, filename, file_size, ip)
 
-        out_name = Path(filename).stem + ".vtt"
+        out_name = safe_download_filename(Path(filename).stem + ".vtt")
         resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
-        resp_headers["X-Validation-Summary"] = result.get("validation", "")
+        resp_headers["X-Validation-Summary"] = result.get("validation", "").encode("ascii", "ignore").decode("ascii")
         resp_headers["X-Validation-ID"] = result.get("validation_id", "")
         return Response(content=result["vtt_text"], media_type="text/vtt", headers=resp_headers)
     finally:

@@ -157,6 +157,18 @@ class CaptionsTest(unittest.TestCase):
         self.assertEqual(response.status_code, 413)
         self.assertIn('upload limit', response.json()['detail'])
 
+    def test_unicode_filename_is_safe_in_download_header(self):
+        from fastapi.testclient import TestClient
+        vtt = 'WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nSome caption text.\n'
+        with patch.object(main, 'require_openai_api_key'), patch.object(
+            main, 'process_media_file', return_value={'vtt_text': vtt, 'validation': 'Timing passed.'}
+        ):
+            response = TestClient(main.app).post(
+                '/transcribe', files={'file': ('Eleanor’s Story_Final.mp4', b'media')}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('Eleanors Story_Final.vtt', response.headers['content-disposition'])
+
     def test_malformed_timestamp_cannot_be_ignored(self):
         vtt='WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nSome valid words\n\nBAD --> BAD\nMissing caption\n'
         self.assertFalse(main.validate_vtt_output(vtt,5)[0])
