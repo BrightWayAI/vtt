@@ -22,7 +22,7 @@ Validation runs before delivery:
 - Recognized words must survive rendering unchanged; readability exceptions are reported.
 - Only the Omega storyboard's VO column and recognized speaker VO lines are compared against the transcript. The UI shows a line-by-line comparison with changed words highlighted. A missing or unreadable storyboard is explicitly marked as not checked.
 
-For numbered video filenames, `AIRTABLE_TOKEN` automatically performs a read-only lookup of the linked Google Doc; the document must be readable by the server. Every upload and URL job uses that storyboard when available and compares the full VO against the transcript. There is no storyboard upload step. Batch items independently look up their own storyboard. Validation details appear in the UI and in the `X-Validation-Report` response header; the downloaded VTT contains captions only.
+For numbered video filenames, `AIRTABLE_TOKEN` automatically performs a read-only lookup of the linked Google Doc; the document must be readable by the server. Every upload and URL job uses that storyboard when available and compares the full VO against the transcript. There is no storyboard upload step. Batch items independently look up their own storyboard. Validation details appear in the UI; the response carries a short-lived validation ID, and the UI fetches the detailed report separately. The downloaded VTT contains captions only.
 
 To benchmark audio directly:
 

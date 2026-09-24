@@ -77,6 +77,12 @@ Pacing Guidance: Keep it moving.
             response=TestClient(main.app).post('/transcribe',files={'file':('107_test.mp4',b'media')})
         lookup.assert_called_once_with(107)
         self.assertIn('Storyboard VO matches',response.headers['X-Validation-Summary'])
+        validation_id = response.headers.get('X-Validation-ID')
+        self.assertTrue(validation_id)
+        report_response = TestClient(main.app).get('/validation/' + validation_id)
+        self.assertEqual(report_response.status_code, 200)
+        self.assertIn('lines', report_response.json()['storyboard'])
+        self.assertNotIn('X-Validation-Report', response.headers)
 
     def test_ui_supports_multi_file_upload_and_keeps_vtt_clean(self):
         self.assertIn('id="file-input" multiple', main.HTML_PAGE)

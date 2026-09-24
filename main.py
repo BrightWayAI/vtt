@@ -3,7 +3,9 @@ import logging
 import math
 import os
 import re
+import secrets
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -44,6 +46,7 @@ RIPTOES_OPENING_RE = re.compile(
 AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE_ID = "appf82sOr6qFvVj6z"
 AIRTABLE_TASKS_TABLE = "tblnMlOiI3q3Zj4jo"
+VALIDATION_REPORTS: dict[str, tuple[float, dict]] = {}
 
 def require_openai_api_key() -> None:
     if not os.environ.get("OPENAI_API_KEY"):
@@ -51,6 +54,18 @@ def require_openai_api_key() -> None:
             status_code=503,
             detail="OPENAI_API_KEY is not set. Add your OpenAI API key to the server environment and retry.",
         )
+
+
+def store_validation_report(report: dict) -> str:
+    now = time.time()
+    # Keep this process-local cache bounded; reports are only needed while the
+    # browser renders the result table.
+    for key, (created, _) in list(VALIDATION_REPORTS.items()):
+        if now - created > 3600:
+            VALIDATION_REPORTS.pop(key, None)
+    key = secrets.token_urlsafe(18)
+    VALIDATION_REPORTS[key] = (now, report)
+    return key
 
 
 def extract_video_id(filename: str) -> int | None:
@@ -595,10 +610,12 @@ def process_media_file(file_path: str, filename: str, file_size: int = 0,
         logger.warning("Airtable record for video ID %s has no readable VO storyboard", video_id)
     vtt_text = transcribe_file(file_path, vo_prompt=storyboard_text)
     report = check_output(parse_vtt_cues(vtt_text), storyboard_text)
+    validation_id = store_validation_report(report)
     return {"filename": Path(filename).stem + ".vtt",
             "vtt_text": vtt_text,
             "validation": report_summary(report),
-            "validation_report": report}
+            "validation_report": report,
+            "validation_id": validation_id}
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +866,29 @@ HTML_PAGE = """
     fillValidationCell(validationCell, rawReport, error);
     row.append(fileCell, linkCell, validationCell);
     body.appendChild(row);
+    return validationCell;
+  }
+
+  async function loadValidationCell(cell, validationId) {
+    if (!validationId) { fillValidationCell(cell, ''); return; }
+    cell.textContent = 'Loading validation…';
+    try {
+      const res = await fetch('/validation/' + encodeURIComponent(validationId));
+      if (!res.ok) throw new Error('Validation report unavailable');
+      fillValidationCell(cell, JSON.stringify(await res.json()));
+    } catch (err) {
+      cell.textContent = err.message;
+    }
+  }
+
+  async function responseError(res, fallback) {
+    const text = await res.text();
+    try {
+      const data = JSON.parse(text);
+      return data.detail || fallback;
+    } catch (_) {
+      return text || fallback;
+    }
   }
 
   fileInput.addEventListener('change', () => setFiles(fileInput.files));
@@ -874,9 +914,10 @@ HTML_PAGE = """
         const fd = new FormData();
         fd.append('file', file);
         const res = await fetch('/transcribe', { method: 'POST', body: fd });
-        if (!res.ok) { const err = await res.json(); throw new Error(file.name + ': ' + (err.detail || 'Transcription failed')); }
+        if (!res.ok) throw new Error(file.name + ': ' + await responseError(res, 'Transcription failed'));
         const url = URL.createObjectURL(await res.blob());
-        addResultRow(resultBody, file.name, url, res.headers.get('X-Validation-Report'));
+        const cell = addResultRow(resultBody, file.name, url, '');
+        await loadValidationCell(cell, res.headers.get('X-Validation-ID'));
       }
     } catch (err) {
       fileStatus.className = 'status error';
@@ -904,7 +945,7 @@ HTML_PAGE = """
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body,
       });
-      if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Failed'); }
+      if (!res.ok) throw new Error(await responseError(res, 'Transcription failed'));
       const blob = await res.blob();
       const disp = res.headers.get('Content-Disposition') || '';
       const match = disp.match(/filename="(.+?)"/);
@@ -912,7 +953,8 @@ HTML_PAGE = """
       const blobUrl = URL.createObjectURL(blob);
       urlStatus.className = 'status success';
       const resultBody = createResultsTable(urlStatus);
-      addResultRow(resultBody, name, blobUrl, res.headers.get('X-Validation-Report'));
+      const cell = addResultRow(resultBody, name, blobUrl, '');
+      await loadValidationCell(cell, res.headers.get('X-Validation-ID'));
     } catch (err) {
       urlStatus.className = 'status error';
       urlStatus.textContent = err.message;
@@ -961,10 +1003,10 @@ HTML_PAGE = """
     if (html !== undefined) el.innerHTML = html;
   }
 
-  function setBatchValidation(index, raw) {
+  async function setBatchValidation(index, validationId) {
     const cell = document.getElementById('bv-' + index);
     if (!cell) return;
-    fillValidationCell(cell, raw);
+    await loadValidationCell(cell, validationId);
   }
 
   function setBatchFiles(files) {
@@ -1009,8 +1051,7 @@ HTML_PAGE = """
         if (!res.ok) {
           let message = 'Transcription failed';
           try {
-            const err = await res.json();
-            message = err.detail || message;
+            message = await responseError(res, message);
           } catch (_) {}
           throw new Error(message);
         }
@@ -1019,7 +1060,7 @@ HTML_PAGE = """
         const name = file.name.replace(/\\.[^.]+$/, '') + '.vtt';
         const links = '<a href="' + blobUrl + '" download="' + name + '">download VTT</a>';
         updateBatchState(i, 'done', 'done ' + links);
-        setBatchValidation(i, res.headers.get('X-Validation-Report'));
+        await setBatchValidation(i, res.headers.get('X-Validation-ID'));
       } catch (err) {
         updateBatchState(i, 'error', (err && err.message) ? err.message : 'error');
       }
@@ -1057,7 +1098,7 @@ HTML_PAGE = """
         const blobUrl = URL.createObjectURL(new Blob([d.vtt_text], {type: 'text/vtt'}));
         const link = 'done <a href="' + blobUrl + '" download="subtitles.vtt">download VTT</a>';
         updateBatchState(d.index, 'done', link);
-        setBatchValidation(d.index, JSON.stringify(d.validation_report || {}));
+        setBatchValidation(d.index, d.validation_id);
       } else if (d.status === 'error') {
         updateBatchState(d.index, 'error', d.message || 'error');
       } else if (d.status === 'complete') {
@@ -1097,7 +1138,7 @@ async def transcribe(request: Request, file: UploadFile = File(...)):
         out_name = Path(original_name).stem + ".vtt"
         resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
         resp_headers["X-Validation-Summary"] = result.get("validation", "")
-        resp_headers["X-Validation-Report"] = json.dumps(result.get("validation_report", {}), ensure_ascii=True)
+        resp_headers["X-Validation-ID"] = result.get("validation_id", "")
         return Response(content=result["vtt_text"], media_type="text/vtt", headers=resp_headers)
     finally:
         os.unlink(tmp.name)
@@ -1120,10 +1161,19 @@ async def transcribe_url(request: Request, url: str = Form(...)):
         out_name = Path(filename).stem + ".vtt"
         resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
         resp_headers["X-Validation-Summary"] = result.get("validation", "")
-        resp_headers["X-Validation-Report"] = json.dumps(result.get("validation_report", {}), ensure_ascii=True)
+        resp_headers["X-Validation-ID"] = result.get("validation_id", "")
         return Response(content=result["vtt_text"], media_type="text/vtt", headers=resp_headers)
     finally:
         os.unlink(file_path)
+
+
+@app.get("/validation/{validation_id}")
+async def validation_report(validation_id: str):
+    entry = VALIDATION_REPORTS.get(validation_id)
+    if not entry or time.time() - entry[0] > 3600:
+        VALIDATION_REPORTS.pop(validation_id, None)
+        raise HTTPException(status_code=404, detail="Validation report expired or was not found.")
+    return entry[1]
 
 
 @app.get("/batch")
@@ -1155,7 +1205,8 @@ async def batch(request: Request, urls: str):
             try:
                 yield f"data: {json.dumps({'index': i, 'status': 'transcribing'})}\n\n"
                 result = process_media_file(file_path, filename, file_size, ip)
-                yield f"data: {json.dumps({'index': i, 'status': 'done', **result})}\n\n"
+                result_for_ui = {key: value for key, value in result.items() if key != 'validation_report'}
+                yield f"data: {json.dumps({'index': i, 'status': 'done', **result_for_ui})}\n\n"
             except Exception as exc:
                 yield f"data: {json.dumps({'index': i, 'status': 'error', 'message': f'Transcription failed: {exc}'})}\n\n"
             finally:
