@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -17,6 +18,8 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydub import AudioSegment
 
 from openai import OpenAI
+from captions import render as render_phrase_captions, tokens as caption_tokens
+from starlette.concurrency import run_in_threadpool
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,22 +31,13 @@ CHUNK_DURATION_MS = 10 * 60 * 1000   # 10 minutes per Whisper chunk
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
 CAPTION_CLEANUP_MODEL = os.environ.get("CAPTION_CLEANUP_MODEL", "gpt-4o-mini")
-ENABLE_CAPTION_CLEANUP = os.environ.get("ENABLE_CAPTION_CLEANUP", "1").lower() not in {"0", "false", "no"}
+ENABLE_CAPTION_CLEANUP = os.environ.get("ENABLE_CAPTION_CLEANUP", "0").lower() not in {"0", "false", "no"}
 
-CAPTION_MIN_DURATION_S = 1.2
-CAPTION_MAX_DURATION_S = 4.5
-CAPTION_MAX_GAP_S = 0.35
-CAPTION_MAX_CHARS = 84
-CAPTION_MAX_WORDS = 16
-CAPTION_LINE_CHARS = 42
 CAPTION_CLEANUP_BATCH_SIZE = 20
 CAPTION_CLEANUP_BATCH_CHARS = 2500
 TRANSCRIPTION_MAX_ATTEMPTS = 2
 MIN_VALID_CUE_DURATION_S = 0.05
 MIN_VALID_TEXT_CHARS = 8
-HIGHLIGHT_MAX_CHARS = 45
-HIGHLIGHT_MAX_WORDS = 8
-HIGHLIGHT_MAX_GAP_S = 0.9
 
 AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE_ID = "appf82sOr6qFvVj6z"
@@ -472,106 +466,6 @@ def write_to_upload_sheet(row: dict) -> None:
 # Transcription helpers
 # ---------------------------------------------------------------------------
 
-# Riptoes is consistently misheared in the opening "where'd you go this time X".
-# This regex catches the phrase regardless of what word Whisper used for the name.
-_RIPTOES_RE = re.compile(
-    r"where'?d?\s+(?:did\s+)?you\s+go\s+this\s+time\s+(\w+)",
-    re.IGNORECASE,
-)
-
-
-def _has_riptoes_opening(segments: list[dict]) -> bool:
-    """Return True if the opening phrase is already captured in the first 10 seconds."""
-    for seg in segments:
-        if seg["start"] > 10:
-            break
-        text = seg.get("text", "")
-        if "riptoes" in text.lower() or bool(_RIPTOES_RE.search(text)):
-            return True
-    return False
-
-
-def _targeted_opening_pass(
-    client: OpenAI, audio_orig: AudioSegment
-) -> tuple[list[dict], list[dict]] | None:
-    """
-    Whisper drops speech-over-music at the very start. Run a second, focused
-    pass on the first 15 seconds with a 2-second warmup pad and a phrase prompt.
-    Returns (words, segments) in original-audio time, or None if still not found.
-    """
-    PAD_S = 2.0
-    clip = (
-        AudioSegment.silent(duration=int(PAD_S * 1000), frame_rate=audio_orig.frame_rate)
-        + audio_orig[:15000]
-    )
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-        clip.export(tmp.name, format="mp3", bitrate="64k")
-        try:
-            result = transcribe_chunk(client, tmp.name, prompt="Where'd you go this time Riptoes")
-        finally:
-            os.unlink(tmp.name)
-
-    raw_segs = getattr(result, "segments", None) or []
-    raw_words = getattr(result, "words", None) or []
-
-    if not any(
-        "riptoes" in s.text.lower() or bool(_RIPTOES_RE.search(s.text))
-        for s in raw_segs
-    ):
-        logger.info("_targeted_opening_pass: phrase not found even in targeted pass")
-        return None
-
-    words = [
-        {"word": w.word, "start": max(0.0, w.start - PAD_S), "end": max(0.0, w.end - PAD_S)}
-        for w in raw_words
-    ]
-    segs = [
-        {"start": max(0.0, s.start - PAD_S), "end": max(0.0, s.end - PAD_S), "text": s.text}
-        for s in raw_segs
-    ]
-    logger.info("_targeted_opening_pass: found opening phrase, first seg at %.2fs", segs[0]["start"] if segs else 0)
-    return words, segs
-
-
-def ensure_riptoes_opening(words: list[dict], segments: list[dict]) -> tuple[list[dict], list[dict]]:
-    """
-    Last-resort fallback: inject a synthetic segment at the start when the targeted
-    pass also failed to find the opening phrase.
-    """
-    if not segments:
-        return words, segments
-
-    first_start = segments[0]["start"]
-    if first_start < 1.5:
-        return words, segments
-
-    opening = {
-        "start": 0.0,
-        "end": min(first_start, 4.0),
-        "text": "Where'd you go this time Riptoes",
-    }
-    return words, [opening] + segments
-
-
-def apply_context_corrections(words: list[dict], segments: list[dict]) -> list[dict]:
-    """Fix proper nouns that are deterministic from their surrounding context."""
-    words = [w.copy() for w in words]
-    for seg in segments:
-        m = _RIPTOES_RE.search(seg.get("text", ""))
-        if not m:
-            continue
-        bad = m.group(1).strip().lower()
-        for w in words:
-            if (
-                w["start"] >= seg["start"] - 0.05
-                and w["end"] <= seg["end"] + 0.05
-                and w["word"].strip().lower() == bad
-            ):
-                w["word"] = "Riptoes"
-                break
-    return words
-
-
 def fmt_ts(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
@@ -604,148 +498,6 @@ def transcribe_chunk(client: OpenAI, chunk_path: str, prompt: str | None = None)
 
 def normalize_caption_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
-
-
-def ends_sentence(text: str) -> bool:
-    return bool(re.search(r'[.!?]["\']?$', text.strip()))
-
-
-def split_caption_text(text: str) -> list[str]:
-    text = normalize_caption_text(text)
-    if not text:
-        return []
-
-    words = text.split()
-    parts: list[str] = []
-    current: list[str] = []
-
-    for word in words:
-        candidate_words = current + [word]
-        candidate = " ".join(candidate_words)
-        if current and (
-            len(candidate) > CAPTION_MAX_CHARS or len(candidate_words) > CAPTION_MAX_WORDS
-        ):
-            parts.append(" ".join(current))
-            current = [word]
-        else:
-            current = candidate_words
-
-        current_text = " ".join(current)
-        if len(current) >= 4 and ends_sentence(current_text):
-            parts.append(current_text)
-            current = []
-
-    if current:
-        parts.append(" ".join(current))
-
-    if len(parts) >= 2 and len(parts[-1].split()) <= 2:
-        parts[-2] = f"{parts[-2]} {parts[-1]}".strip()
-        parts.pop()
-
-    return parts
-
-
-def distribute_segment_text(seg: dict) -> list[dict]:
-    start = seg["start"]
-    end = seg["end"] if seg["end"] > seg["start"] else seg["start"] + 0.2
-    text = normalize_caption_text(seg.get("text", ""))
-    parts = split_caption_text(text)
-    if len(parts) <= 1:
-        return [{"start": start, "end": end, "text": text}] if text else []
-
-    total_chars = sum(max(len(part), 1) for part in parts)
-    duration = end - start
-    cursor = start
-    distributed = []
-
-    for i, part in enumerate(parts):
-        if i == len(parts) - 1:
-            part_end = end
-        else:
-            share = max(len(part), 1) / total_chars
-            part_end = cursor + duration * share
-        if part_end <= cursor:
-            part_end = cursor + 0.2
-        distributed.append({"start": cursor, "end": min(part_end, end), "text": part})
-        cursor = distributed[-1]["end"]
-
-    if distributed:
-        distributed[-1]["end"] = max(distributed[-1]["end"], end)
-
-    return distributed
-
-
-def merge_caption_segments(all_segments: list[dict]) -> list[dict]:
-    expanded = []
-    for seg in all_segments:
-        expanded.extend(distribute_segment_text(seg))
-
-    merged = []
-    current = None
-
-    for seg in expanded:
-        text = normalize_caption_text(seg.get("text", ""))
-        if not text:
-            continue
-
-        seg_start = seg["start"]
-        seg_end = seg["end"] if seg["end"] > seg["start"] else seg["start"] + 0.2
-
-        if current is None:
-            current = {"start": seg_start, "end": seg_end, "text": text}
-            continue
-
-        combined_text = f"{current['text']} {text}".strip()
-        combined_duration = seg_end - current["start"]
-        gap = max(0.0, seg_start - current["end"])
-
-        should_merge = (
-            gap <= CAPTION_MAX_GAP_S
-            and combined_duration <= CAPTION_MAX_DURATION_S
-            and len(combined_text) <= CAPTION_MAX_CHARS
-            and len(combined_text.split()) <= CAPTION_MAX_WORDS
-            and (
-                current["end"] - current["start"] < CAPTION_MIN_DURATION_S
-                or not ends_sentence(current["text"])
-            )
-        )
-
-        if should_merge:
-            current["end"] = seg_end
-            current["text"] = combined_text
-        else:
-            merged.append(current)
-            current = {"start": seg_start, "end": seg_end, "text": text}
-
-    if current is not None:
-        merged.append(current)
-
-    return merged
-
-
-def balance_caption_lines(text: str) -> str:
-    text = normalize_caption_text(text)
-    if len(text) <= CAPTION_LINE_CHARS:
-        return text
-
-    words = text.split()
-    best_break = None
-    best_score = None
-
-    for i in range(1, len(words)):
-        left = " ".join(words[:i])
-        right = " ".join(words[i:])
-        longest = max(len(left), len(right))
-        if longest > CAPTION_MAX_CHARS:
-            continue
-        score = abs(len(left) - len(right))
-        if best_score is None or score < best_score:
-            best_score = score
-            best_break = (left, right)
-
-    if best_break is None:
-        return text
-    return f"{best_break[0]}\n{best_break[1]}"
 
 
 def extract_json_array(text: str) -> list | None:
@@ -786,8 +538,8 @@ def cleanup_segment_batch(
 
     prompt = (
         "Correct these caption lines from automatic speech recognition.\n"
-        "Fix obvious recognition mistakes, capitalization, and punctuation.\n"
-        "Do not invent words that are not supported by the audio or reference script.\n"
+        "Fix capitalization and punctuation only. Preserve every spoken word.\n"
+        "You do not have the audio. Never add, remove, replace, or reorder words.\n"
         "Keep the same number of items and preserve each line's meaning.\n"
         "Return JSON only as an array of strings in the same order.\n"
         f"{reference_block}\n"
@@ -818,6 +570,9 @@ def cleanup_segment_batch(
 
     cleaned = []
     for seg, text in zip(batch, corrected):
+        if not isinstance(text, str) or caption_tokens(text) != caption_tokens(seg.get("text", "")):
+            logger.warning("Rejected cleanup that changed spoken words")
+            text = seg.get("text", "")
         cleaned.append(
             {
                 **seg,
@@ -856,130 +611,13 @@ def cleanup_caption_segments(
     return cleaned
 
 
-def apply_cleaned_segment_text_to_words(
-    words: list[dict], original_segments: list[dict], cleaned_segments: list[dict]
-) -> list[dict]:
-    updated_words = [w.copy() for w in words]
-    if len(original_segments) != len(cleaned_segments):
-        return updated_words
-
-    for original, cleaned in zip(original_segments, cleaned_segments):
-        seg_words = [
-            w for w in updated_words
-            if w["start"] >= original["start"] - 0.05 and w["start"] < original["end"] + 0.05
-        ]
-        cleaned_tokens = normalize_caption_text(cleaned.get("text", "")).split()
-        if seg_words and len(seg_words) == len(cleaned_tokens):
-            for word, token in zip(seg_words, cleaned_tokens):
-                word["word"] = token
-
-    return updated_words
-
-
-def split_words_into_highlight_windows(seg_words: list[dict]) -> list[list[dict]]:
-    windows = []
-    current: list[dict] = []
-
-    for word in seg_words:
-        token = word["word"].strip()
-        if not token:
-            continue
-
-        candidate = current + [word]
-        candidate_text = " ".join(w["word"].strip() for w in candidate if w["word"].strip())
-        gap = 0.0
-        if current:
-            gap = max(0.0, word["start"] - current[-1]["end"])
-
-        should_split = (
-            bool(current)
-            and (
-                len(candidate_text) > HIGHLIGHT_MAX_CHARS
-                or len(candidate) > HIGHLIGHT_MAX_WORDS
-                or gap > HIGHLIGHT_MAX_GAP_S
-            )
-        )
-
-        if should_split:
-            windows.append(current)
-            current = [word]
-        else:
-            current = candidate
-
-        current_text = " ".join(w["word"].strip() for w in current if w["word"].strip())
-        if len(current_text) >= 30 and ends_sentence(current_text):
-            windows.append(current)
-            current = []
-
-    if current:
-        windows.append(current)
-
-    return [window for window in windows if window]
-
-
-def build_highlight_window_text(window_words: list[dict], active_index: int) -> str:
-    parts = []
-    for i, word in enumerate(window_words):
-        text = word["word"].strip()
-        if not text:
-            continue
-        if i == active_index:
-            parts.append(f"<v>{text}</v>")
-        else:
-            parts.append(text)
-    return " ".join(parts)
-
-
-def build_highlight_vtt(all_words: list[dict], all_segments: list[dict]) -> str:
-    if not all_words and not all_segments:
-        return "WEBVTT\nKind: captions\nLanguage: en\n\n"
-
-    lines = ["WEBVTT", "Kind: captions", "Language: en", ""]
-    last_cue_end = 0.0
-
-    for seg in all_segments:
-        seg_words = [
-            w for w in all_words
-            if w["start"] >= seg["start"] - 0.05 and w["start"] < seg["end"] + 0.05
-        ]
-        if not seg_words:
-            seg_start = seg["start"]
-            seg_end = seg["end"] if seg["end"] > seg["start"] else seg["start"] + MIN_VALID_CUE_DURATION_S
-            lines.append(f"{fmt_ts(seg_start)} --> {fmt_ts(seg_end)}")
-            lines.append(normalize_caption_text(seg.get("text", "")))
-            lines.append("")
-            continue
-
-        for window in split_words_into_highlight_windows(seg_words):
-            for i, word in enumerate(window):
-                cue_start = max(word["start"], last_cue_end)
-                if i + 1 < len(window):
-                    cue_end = max(window[i + 1]["start"], cue_start + MIN_VALID_CUE_DURATION_S)
-                else:
-                    cue_end = max(word["end"], seg["end"], cue_start + MIN_VALID_CUE_DURATION_S)
-                if cue_end <= cue_start:
-                    cue_end = cue_start + MIN_VALID_CUE_DURATION_S
-
-                lines.append(f"{fmt_ts(cue_start)} --> {fmt_ts(cue_end)}")
-                lines.append(build_highlight_window_text(window, i))
-                lines.append("")
-                last_cue_end = cue_end
-
-    return "\n".join(lines)
-
-
-def build_caption_vtt(all_segments) -> str:
-    if not all_segments:
-        return "WEBVTT\nKind: captions\nLanguage: en\n\n"
-
-    lines = ["WEBVTT", "Kind: captions", "Language: en", ""]
-
-    for cue in merge_caption_segments(all_segments):
-        lines.append(f"{fmt_ts(cue['start'])} --> {fmt_ts(cue['end'])}")
-        lines.append(balance_caption_lines(cue["text"]))
-        lines.append("")
-
-    return "\n".join(lines)
+def build_caption_vtt(all_segments, all_words=None, audio_duration_s=None) -> str:
+    duration = audio_duration_s if audio_duration_s is not None else max(
+        (s["end"] for s in all_segments), default=0.0
+    )
+    vtt, report = render_phrase_captions(all_words or [], all_segments, duration, fmt_ts)
+    logger.info("Caption readability: %s", report)
+    return vtt
 
 
 def validate_segments_for_vtt(segments: list[dict], audio_duration_s: float) -> tuple[bool, str]:
@@ -995,7 +633,11 @@ def validate_segments_for_vtt(segments: list[dict], audio_duration_s: float) -> 
         end = float(seg.get("end", start))
         text = normalize_caption_text(seg.get("text", ""))
 
-        if start < prev_start - 0.1:
+        if not math.isfinite(start) or not math.isfinite(end):
+            return False, "Non-finite segment timing."
+        if start < 0 or end <= start or end > audio_duration_s + 0.05:
+            return False, "Segment timing outside media bounds or empty."
+        if start < prev_start - 0.001:
             return False, "Segment timings are out of order."
         prev_start = start
 
@@ -1049,6 +691,8 @@ def validate_vtt_output(vtt_text: str, audio_duration_s: float) -> tuple[bool, s
         return False, "VTT header missing."
 
     cues = parse_vtt_cues(vtt_text)
+    if sum("-->" in line for line in vtt_text.splitlines()) != len(cues):
+        return False, "Malformed cue timestamp."
     if not cues:
         return False, "No VTT cues were generated."
 
@@ -1056,11 +700,15 @@ def validate_vtt_output(vtt_text: str, audio_duration_s: float) -> tuple[bool, s
     prev_end = 0.0
 
     for start, end, text in cues:
+        if start < 0 or end > audio_duration_s + 0.001:
+            return False, "Cue timing outside media bounds."
+        if not text:
+            return False, "Empty caption text."
         if end <= start:
             return False, "Cue timing was zero or negative."
         if end - start < MIN_VALID_CUE_DURATION_S:
             return False, "Cue timing was too short."
-        if start + 0.1 < prev_end:
+        if start + 0.0005 < prev_end:
             return False, "Cue timings overlap out of order."
         prev_end = end
         total_text_chars += len(normalize_caption_text(text))
@@ -1071,78 +719,91 @@ def validate_vtt_output(vtt_text: str, audio_duration_s: float) -> tuple[bool, s
     return True, "ok"
 
 
+def transcribe_audio_clip(client, audio, prompt=None):
+    """Use lossless mono audio for short clips, compressed audio for large chunks."""
+    # 10 minutes at 16 kHz mono PCM is under the transcription upload limit.
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        try:
+            audio.export(tmp.name, format="wav").close()
+            return transcribe_chunk(client, tmp.name, prompt=prompt)
+        finally:
+            os.unlink(tmp.name)
+
+
+def audio_chunk_ranges(audio):
+    """Prefer a nearby quiet boundary over cutting a word at exactly 10 minutes."""
+    from pydub.silence import detect_silence
+    start = 0
+    while start < len(audio):
+        end = min(start + CHUNK_DURATION_MS, len(audio))
+        if end < len(audio):
+            search_start = max(start, end - 10000)
+            quiet = detect_silence(audio[search_start:end], min_silence_len=350,
+                                   silence_thresh=-38, seek_step=20)
+            if quiet:
+                left, right = quiet[-1]
+                end = search_start + (left + right) // 2
+        if end <= start:
+            raise ValueError("Audio chunk did not advance")
+        yield start, end
+        start = end
+
+
 def collect_transcription_data(
     client: OpenAI, audio_orig: AudioSegment, vo_prompt: str | None = None
 ) -> tuple[list[dict], list[dict]]:
+    audio_orig = audio_orig.set_channels(1).set_frame_rate(16000).set_sample_width(2)
+    pad = AudioSegment.silent(duration=1000, frame_rate=16000)
+    words, segments = [], []
+    for start_ms, end_ms in audio_chunk_ranges(audio_orig):
+        result = transcribe_audio_clip(client, pad + audio_orig[start_ms:end_ms], vo_prompt)
+        offset = start_ms / 1000.0 - 1.0
+        for word in getattr(result, "words", None) or []:
+            words.append({"word": word.word, "start": max(0.0, word.start + offset),
+                          "end": max(0.0, word.end + offset)})
+        for seg in getattr(result, "segments", None) or []:
+            segments.append({"text": seg.text, "start": max(0.0, seg.start + offset),
+                             "end": max(0.0, seg.end + offset)})
 
-    # Prepend 1 s of silence so Whisper "warms up" before speech starts;
-    # subtract that offset from all returned timestamps.
-    PAD_MS = 1000
-    pad_s = PAD_MS / 1000.0
-    audio = AudioSegment.silent(duration=PAD_MS, frame_rate=audio_orig.frame_rate) + audio_orig
-    duration_ms = len(audio)
-
-    if duration_ms <= CHUNK_DURATION_MS:
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            audio.export(tmp.name, format="mp3", bitrate="64k")
-            result = transcribe_chunk(client, tmp.name, prompt=vo_prompt)
-            os.unlink(tmp.name)
-
-        words = [{"word": w.word, "start": max(0.0, w.start - pad_s), "end": max(0.0, w.end - pad_s)}
-                 for w in (getattr(result, "words", None) or [])]
-        segments = [{"start": max(0.0, s.start - pad_s), "end": max(0.0, s.end - pad_s), "text": s.text}
-                    for s in (getattr(result, "segments", None) or [])]
-    else:
-        words = []
-        segments = []
-
-        for chunk_start_ms in range(0, duration_ms, CHUNK_DURATION_MS):
-            chunk_end_ms = min(chunk_start_ms + CHUNK_DURATION_MS, duration_ms)
-            chunk = audio[chunk_start_ms:chunk_end_ms]
-            offset_s = chunk_start_ms / 1000.0 - pad_s
-
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-                chunk.export(tmp.name, format="mp3", bitrate="64k")
-                result = transcribe_chunk(client, tmp.name, prompt=vo_prompt)
-                os.unlink(tmp.name)
-
-            for w in getattr(result, "words", None) or []:
-                words.append({"word": w.word, "start": max(0.0, w.start + offset_s), "end": max(0.0, w.end + offset_s)})
-            for s in getattr(result, "segments", None) or []:
-                segments.append({"start": max(0.0, s.start + offset_s), "end": max(0.0, s.end + offset_s), "text": s.text})
-
-    if not _has_riptoes_opening(segments):
-        logger.info("transcribe_file: opening phrase missing, running targeted pass")
-        opening = _targeted_opening_pass(client, audio_orig)
-        if opening:
-            o_words, o_segs = opening
-            OPENING_WINDOW_S = 10.0
-            segments = sorted(
-                [s for s in o_segs if s["start"] < OPENING_WINDOW_S]
-                + [s for s in segments if s["start"] >= OPENING_WINDOW_S],
-                key=lambda s: s["start"],
-            )
-            words = sorted(
-                [w for w in o_words if w["start"] < OPENING_WINDOW_S]
-                + [w for w in words if w["start"] >= OPENING_WINDOW_S],
-                key=lambda w: w["start"],
-            )
-        else:
-            words, segments = ensure_riptoes_opening(words, segments)
-
+    # Full-track ASR sometimes misses speech over introductory music. Re-read
+    # the audio with context, without supplying or synthesizing expected dialogue.
+    if segments and 3.0 <= segments[0]["start"] <= 20.0:
+        boundary = segments[0]["start"]
+        try:
+            result = transcribe_audio_clip(client, pad + audio_orig[:int((boundary + 5) * 1000)])
+            recovered = []
+            for seg in getattr(result, "segments", None) or []:
+                if (getattr(seg, "no_speech_prob", 0) > .5
+                    or getattr(seg, "avg_logprob", 0) < -1.0
+                    or getattr(seg, "compression_ratio", 0) > 2.4):
+                    continue
+                start, end = max(0., seg.start - 1), seg.end - 1
+                if start < boundary and 0 < end <= boundary + .05:
+                    recovered.append({"start": start, "end": min(end, boundary), "text": seg.text})
+            if recovered:
+                prefix_words = [{"word": w.word, "start": max(0., w.start - 1), "end": min(boundary, w.end - 1)}
+                                for w in getattr(result, "words", None) or []
+                                if any(s["start"] <= (w.start + w.end)/2 - 1 < s["end"] for s in recovered)]
+                words = prefix_words + words
+                segments = recovered + segments
+                logger.info("Recovered %s opening speech segments from audio", len(recovered))
+        except Exception as exc:
+            logger.warning("Opening audio recheck failed; retaining original transcript: %s", exc)
     return words, segments
 
 
 def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
     client = OpenAI()
-    audio_orig = AudioSegment.from_file(file_path)
+    audio_orig = AudioSegment.from_file(file_path).set_channels(1).set_frame_rate(16000)
     audio_duration_s = len(audio_orig) / 1000.0
     last_error: Exception | None = None
 
     for attempt in range(1, TRANSCRIPTION_MAX_ATTEMPTS + 1):
         try:
             words, segments = collect_transcription_data(client, audio_orig, vo_prompt=vo_prompt)
-            words = apply_context_corrections(words, segments)
+            ok, message = validate_segments_for_vtt(segments, audio_duration_s)
+            if not ok:
+                raise ValueError(message)
             raw_words = [
                 {
                     "word": normalize_caption_text(word.get("word", "")),
@@ -1167,30 +828,13 @@ def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
                 raise ValueError(message)
 
             spellchecked_segments = cleanup_caption_segments(client, raw_segments, reference_text=vo_prompt)
-            spellchecked_words = apply_cleaned_segment_text_to_words(raw_words, raw_segments, spellchecked_segments)
-            candidates = [
-                ("spellchecked", spellchecked_words, spellchecked_segments),
-                ("raw", raw_words, raw_segments),
-            ]
-
-            for label, candidate_words, candidate_segments in candidates:
-                renderers = []
-                if candidate_words:
-                    renderers.append(("highlight", build_highlight_vtt(candidate_words, candidate_segments)))
-                renderers.append(("plain", build_caption_vtt(candidate_segments)))
-
-                for render_label, vtt_text in renderers:
-                    valid_vtt, vtt_message = validate_vtt_output(vtt_text, audio_duration_s)
-                    if valid_vtt:
-                        logger.info("transcribe_file: attempt %s accepted %s %s VTT", attempt, label, render_label)
-                        return vtt_text
-                    logger.warning(
-                        "transcribe_file: attempt %s rejected %s %s VTT: %s",
-                        attempt,
-                        label,
-                        render_label,
-                        vtt_message,
-                    )
+            for label, candidate_segments in [("cleaned", spellchecked_segments), ("raw", raw_segments)]:
+                vtt_text = build_caption_vtt(candidate_segments, raw_words, audio_duration_s)
+                valid_vtt, vtt_message = validate_vtt_output(vtt_text, audio_duration_s)
+                if valid_vtt:
+                    logger.info("transcribe_file: attempt %s accepted %s phrase VTT", attempt, label)
+                    return vtt_text
+                logger.warning("Rejected %s VTT: %s", label, vtt_message)
 
             raise ValueError("Generated VTT failed validation.")
         except Exception as exc:
@@ -1703,7 +1347,7 @@ async def transcribe(request: Request, file: UploadFile = File(...)):
         tmp.write(contents)
         tmp.close()
         ip = request.client.host if request.client else None
-        result = process_media_file(tmp.name, original_name, len(contents), ip)
+        result = await run_in_threadpool(process_media_file, tmp.name, original_name, len(contents), ip)
 
         out_name = Path(original_name).stem + ".vtt"
         resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
@@ -1718,7 +1362,7 @@ async def transcribe(request: Request, file: UploadFile = File(...)):
 async def transcribe_url(request: Request, url: str = Form(...)):
     require_openai_api_key()
     try:
-        file_path, filename, file_size = download_url_to_temp(url)
+        file_path, filename, file_size = await run_in_threadpool(download_url_to_temp, url)
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=400, detail=f"Download failed: HTTP {exc.response.status_code}")
     except Exception as exc:
@@ -1726,7 +1370,7 @@ async def transcribe_url(request: Request, url: str = Form(...)):
 
     try:
         ip = request.client.host if request.client else None
-        result = process_media_file(file_path, filename, file_size, ip)
+        result = await run_in_threadpool(process_media_file, file_path, filename, file_size, ip)
 
         out_name = Path(filename).stem + ".vtt"
         resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}

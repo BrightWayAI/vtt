@@ -1,0 +1,83 @@
+[
+  {
+    "video": "107_The Dust Bowl_Final.mp4",
+    "duration": 102.976,
+    "new": {
+      "cues": 29,
+      "median_seconds": 2.882,
+      "under_1_second": 0,
+      "overlaps": 0,
+      "end": 102.976
+    },
+    "valid": true,
+    "validation": "ok",
+    "text_preserved": true,
+    "readability": {
+      "cue_count": 29,
+      "short_cues": 0,
+      "fast_cues": 0,
+      "long_lines": 0
+    },
+    "old": {
+      "cues": 246,
+      "median_seconds": 0.28,
+      "under_1_second": 238,
+      "overlaps": 0,
+      "end": 102.76
+    }
+  },
+  {
+    "video": "143_Lin-Manuel Miranda \u2013 Musical Creator_Final.mp4",
+    "duration": 108.842,
+    "new": {
+      "cues": 30,
+      "median_seconds": 2.752,
+      "under_1_second": 0,
+      "overlaps": 0,
+      "end": 108.842
+    },
+    "valid": true,
+    "validation": "ok",
+    "text_preserved": true,
+    "readability": {
+      "cue_count": 30,
+      "short_cues": 0,
+      "fast_cues": 0,
+      "long_lines": 0
+    },
+    "old": {
+      "cues": 261,
+      "median_seconds": 0.2,
+      "under_1_second": 247,
+      "overlaps": 0,
+      "end": 109.01
+    }
+  },
+  {
+    "video": "201_The Panama Canal_Final.mp4",
+    "duration": 143.742,
+    "new": {
+      "cues": 42,
+      "median_seconds": 2.912,
+      "under_1_second": 0,
+      "overlaps": 0,
+      "end": 143.742
+    },
+    "valid": true,
+    "validation": "ok",
+    "text_preserved": true,
+    "readability": {
+      "cue_count": 42,
+      "short_cues": 1,
+      "fast_cues": 0,
+      "long_lines": 0
+    },
+    "old": {
+      "cues": 396,
+      "median_seconds": 0.22,
+      "under_1_second": 378,
+      "overlaps": 0,
+      "end": 143.54
+    }
+  }
+]
