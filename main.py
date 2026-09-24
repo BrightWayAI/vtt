@@ -686,9 +686,12 @@ HTML_PAGE = """
   .status.error { color: #ff6b6b; }
   .status.success a { color: #4a9eff; text-decoration: none; font-weight: 600; }
   .results-table { width: 100%; margin-top: 1rem; border-collapse: collapse; text-align: left; font-size: 0.8rem; }
+  .results-wrap { width: 100%; overflow-x: auto; }
   .results-table th { color: #888; font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; padding: .55rem .45rem; border-bottom: 1px solid #333; }
   .results-table td { padding: .7rem .45rem; border-bottom: 1px solid #292929; vertical-align: top; }
-  .results-table td:first-child { word-break: break-word; max-width: 170px; }
+  .results-table td:first-child { word-break: break-word; width: 170px; max-width: 170px; }
+  .results-table td:nth-child(2) { width: 42%; min-width: 460px; }
+  .results-table td:nth-child(3) { width: 58%; min-width: 680px; }
   .results-table a { color: #4a9eff; font-weight: 600; text-decoration: none; white-space: nowrap; }
   .validation-badge { display: inline-block; padding: .2rem .4rem; border-radius: 4px; font-size: .68rem; font-weight: 700; letter-spacing: .04em; }
   .validation-badge.matched { color: #8ee0a8; background: rgba(70, 180, 100, .16); }
@@ -710,6 +713,13 @@ HTML_PAGE = """
   .shot-status { white-space: nowrap; color: #b8c1cc; }
   .shot-status.matched { color: #83d6a3; }
   .shot-status.extra, .shot-status.review { color: #ffd27d; }
+  .vtt-editor { display: flex; flex-direction: column; gap: .45rem; min-width: 420px; }
+  .vtt-editor textarea { width: 100%; min-height: 360px; resize: vertical; box-sizing: border-box; background: #101419; color: #d8e0e8; border: 1px solid #34404d; border-radius: 6px; padding: .65rem; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; tab-size: 2; }
+  .vtt-toolbar { display: flex; align-items: center; gap: .65rem; }
+  .vtt-toolbar button { width: auto; padding: .4rem .7rem; font-size: .78rem; }
+  .vtt-dirty { color: #ffd27a; font-size: .72rem; }
+  .validation-detail { max-height: 500px; overflow: auto; padding-right: .25rem; }
+  .line-diff { min-width: 620px; }
 
   .batch-log { margin-top: 1rem; font-size: 0.85rem; max-height: 300px; overflow-y: auto; }
   .batch-section { margin-bottom: 1.25rem; }
@@ -829,6 +839,7 @@ HTML_PAGE = """
 
   function createResultsTable(container) {
     container.innerHTML = '';
+    container.classList.add('results-wrap');
     const table = document.createElement('table');
     table.className = 'results-table';
     table.innerHTML = '<thead><tr><th>File</th><th>VTT</th><th>Validation</th></tr></thead>';
@@ -894,15 +905,29 @@ HTML_PAGE = """
     }
   }
 
-  function addResultRow(body, filename, blobUrl, rawReport, error) {
+  function addResultRow(body, filename, blobUrl, rawReport, error, vttText) {
     const row = document.createElement('tr');
     const fileCell = document.createElement('td');
     fileCell.textContent = filename;
     const linkCell = document.createElement('td');
-    if (blobUrl) {
+    if (blobUrl || vttText) {
+      const editor = document.createElement('div'); editor.className = 'vtt-editor';
+      const textarea = document.createElement('textarea');
+      textarea.value = vttText || '';
+      textarea.setAttribute('aria-label', 'Editable VTT for ' + filename);
       const link = document.createElement('a');
-      link.href = blobUrl; link.download = filename.replace(/[^.]+$/, '') + 'vtt'; link.textContent = 'Download';
-      linkCell.appendChild(link);
+      link.download = filename.replace(/[^.]+$/, '') + 'vtt'; link.textContent = 'Download VTT';
+      let currentUrl = blobUrl;
+      const toolbar = document.createElement('div'); toolbar.className = 'vtt-toolbar';
+      const dirty = document.createElement('span'); dirty.className = 'vtt-dirty'; dirty.textContent = 'Click in the editor to make corrections.';
+      toolbar.append(link, dirty);
+      textarea.addEventListener('input', () => {
+        if (currentUrl) URL.revokeObjectURL(currentUrl);
+        currentUrl = URL.createObjectURL(new Blob([textarea.value], {type: 'text/vtt;charset=utf-8'}));
+        link.href = currentUrl;
+        dirty.textContent = 'Edited — download includes your changes.';
+      });
+      editor.append(textarea, toolbar); linkCell.appendChild(editor);
     } else { linkCell.textContent = 'Failed'; }
     const validationCell = document.createElement('td');
     fillValidationCell(validationCell, rawReport, error);
@@ -957,8 +982,9 @@ HTML_PAGE = """
         fd.append('file', file);
         const res = await fetch('/transcribe', { method: 'POST', body: fd });
         if (!res.ok) throw new Error(file.name + ': ' + await responseError(res, 'Transcription failed'));
-        const url = URL.createObjectURL(await res.blob());
-        const cell = addResultRow(resultBody, file.name, url, '');
+        const vttText = await res.text();
+        const url = URL.createObjectURL(new Blob([vttText], {type: 'text/vtt;charset=utf-8'}));
+        const cell = addResultRow(resultBody, file.name, url, '', null, vttText);
         await loadValidationCell(cell, res.headers.get('X-Validation-ID'));
       }
     } catch (err) {
@@ -988,14 +1014,14 @@ HTML_PAGE = """
         body,
       });
       if (!res.ok) throw new Error(await responseError(res, 'Transcription failed'));
-      const blob = await res.blob();
+      const vttText = await res.text();
       const disp = res.headers.get('Content-Disposition') || '';
       const match = disp.match(/filename="(.+?)"/);
       const name = match ? match[1] : 'subtitles.vtt';
-      const blobUrl = URL.createObjectURL(blob);
+      const blobUrl = URL.createObjectURL(new Blob([vttText], {type: 'text/vtt;charset=utf-8'}));
       urlStatus.className = 'status success';
       const resultBody = createResultsTable(urlStatus);
-      const cell = addResultRow(resultBody, name, blobUrl, '');
+      const cell = addResultRow(resultBody, name, blobUrl, '', null, vttText);
       await loadValidationCell(cell, res.headers.get('X-Validation-ID'));
     } catch (err) {
       urlStatus.className = 'status error';
@@ -1043,6 +1069,25 @@ HTML_PAGE = """
     if (!el) return;
     el.className = 'state ' + status;
     if (html !== undefined) el.innerHTML = html;
+  }
+
+  function setBatchEditor(index, text, filename) {
+    const state = document.getElementById('bs-' + index);
+    if (!state) return;
+    const cell = state.closest('td'); cell.innerHTML = '';
+    const editor = document.createElement('div'); editor.className = 'vtt-editor';
+    const textarea = document.createElement('textarea'); textarea.value = text;
+    textarea.setAttribute('aria-label', 'Editable VTT for ' + filename);
+    const link = document.createElement('a'); link.download = filename; link.textContent = 'Download VTT';
+    let url = URL.createObjectURL(new Blob([text], {type: 'text/vtt;charset=utf-8'})); link.href = url;
+    const dirty = document.createElement('span'); dirty.className = 'vtt-dirty'; dirty.textContent = 'Edit, then download.';
+    textarea.addEventListener('input', () => {
+      if (url) URL.revokeObjectURL(url);
+      url = URL.createObjectURL(new Blob([textarea.value], {type: 'text/vtt;charset=utf-8'}));
+      link.href = url; dirty.textContent = 'Edited — download includes your changes.';
+    });
+    const toolbar = document.createElement('div'); toolbar.className = 'vtt-toolbar'; toolbar.append(link, dirty);
+    editor.append(textarea, toolbar); cell.appendChild(editor);
   }
 
   async function setBatchValidation(index, validationId) {
@@ -1097,11 +1142,9 @@ HTML_PAGE = """
           } catch (_) {}
           throw new Error(message);
         }
-        const blob = await res.blob();
-        const blobUrl = URL.createObjectURL(blob);
+        const vttText = await res.text();
         const name = file.name.replace(/\\.[^.]+$/, '') + '.vtt';
-        const links = '<a href="' + blobUrl + '" download="' + name + '">download VTT</a>';
-        updateBatchState(i, 'done', 'done ' + links);
+        setBatchEditor(i, vttText, name);
         await setBatchValidation(i, res.headers.get('X-Validation-ID'));
       } catch (err) {
         updateBatchState(i, 'error', (err && err.message) ? err.message : 'error');
@@ -1137,9 +1180,7 @@ HTML_PAGE = """
       } else if (d.status === 'transcribing') {
         updateBatchState(d.index, 'transcribing', 'transcribing…');
       } else if (d.status === 'done') {
-        const blobUrl = URL.createObjectURL(new Blob([d.vtt_text], {type: 'text/vtt'}));
-        const link = 'done <a href="' + blobUrl + '" download="subtitles.vtt">download VTT</a>';
-        updateBatchState(d.index, 'done', link);
+        setBatchEditor(d.index, d.vtt_text, 'subtitles-' + (d.index + 1) + '.vtt');
         setBatchValidation(d.index, d.validation_id);
       } else if (d.status === 'error') {
         updateBatchState(d.index, 'error', d.message || 'error');
