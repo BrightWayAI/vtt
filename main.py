@@ -29,7 +29,9 @@ app = FastAPI()
 MAX_UPLOAD_SIZE = int(os.environ.get("MAX_UPLOAD_SIZE_BYTES", str(2 * 1024 * 1024 * 1024)))
 CHUNK_DURATION_MS = 10 * 60 * 1000   # 10 minutes per Whisper chunk
 
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
+# GPT-4o Transcribe is the higher-accuracy replacement for Whisper. Keep the
+# environment override so deployments can fall back to whisper-1 if needed.
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "gpt-4o-transcribe")
 CAPTION_CLEANUP_MODEL = os.environ.get("CAPTION_CLEANUP_MODEL", "gpt-4o-mini")
 ENABLE_CAPTION_CLEANUP = os.environ.get("ENABLE_CAPTION_CLEANUP", "0").lower() not in {"0", "false", "no"}
 
@@ -163,6 +165,11 @@ def transcribe_chunk(client: OpenAI, chunk_path: str, prompt: str | None = None)
 
 def normalize_caption_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def contains_transcription_artifact(text: str) -> bool:
+    """Detect markup/formatting hallucinations that must never reach a VTT."""
+    return bool(re.search(r"(?:</?(?:font|html|body|div|span|p)\b|&lt;/?(?:font|html|body|div|span|p)\b)", text or "", re.I))
 
 
 def extract_json_array(text: str) -> list | None:
@@ -504,7 +511,11 @@ def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
 
     for attempt in range(1, TRANSCRIPTION_MAX_ATTEMPTS + 1):
         try:
-            words, segments = collect_transcription_data(client, audio_orig, vo_prompt=vo_prompt)
+            # A storyboard prompt can bias an ASR pass toward visible text or
+            # formatting artifacts. A retry without that context is safer than
+            # shipping a caption containing markup.
+            attempt_prompt = vo_prompt if attempt == 1 else None
+            words, segments = collect_transcription_data(client, audio_orig, vo_prompt=attempt_prompt)
             ok, message = validate_segments_for_vtt(segments, audio_duration_s)
             if not ok:
                 raise ValueError(message)
@@ -526,6 +537,9 @@ def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
                 for seg in segments
                 if normalize_caption_text(seg.get("text", ""))
             ]
+
+            if any(contains_transcription_artifact(seg["text"]) for seg in raw_segments):
+                raise ValueError("Transcription contained markup-like artifacts; retrying without storyboard context.")
 
             ok, message = validate_segments_for_vtt(raw_segments, audio_duration_s)
             if not ok:
@@ -690,6 +704,12 @@ HTML_PAGE = """
   .line-diff .line-number { color: #666; width: 2rem; }
   .diff-missing { color: #ff9b9b; background: rgba(210, 70, 70, .18); text-decoration: line-through; }
   .diff-extra { color: #ffd27a; background: rgba(230, 160, 40, .18); }
+  .audio-cue { padding: .2rem 0; border-bottom: 1px solid #242424; }
+  .audio-cue:last-child { border-bottom: 0; }
+  .audio-cue small { color: #7f8b99; font-variant-numeric: tabular-nums; }
+  .shot-status { white-space: nowrap; color: #b8c1cc; }
+  .shot-status.matched { color: #83d6a3; }
+  .shot-status.extra, .shot-status.review { color: #ffd27d; }
 
   .batch-log { margin-top: 1rem; font-size: 0.85rem; max-height: 300px; overflow-y: auto; }
   .batch-section { margin-bottom: 1.25rem; }
@@ -838,9 +858,9 @@ HTML_PAGE = """
       if (storyboard.lines && storyboard.lines.length) {
         const details = document.createElement('details');
         details.open = storyboard.status === 'review';
-        const summary = document.createElement('summary'); summary.textContent = 'Line-by-line comparison'; details.appendChild(summary);
+        const summary = document.createElement('summary'); summary.textContent = 'Shot-by-shot audio comparison'; details.appendChild(summary);
         const table = document.createElement('table'); table.className = 'line-diff';
-        table.innerHTML = '<thead><tr><th>#</th><th>Storyboard VO</th><th>Transcript</th></tr></thead>';
+        table.innerHTML = '<thead><tr><th>Shot</th><th>Storyboard VO</th><th>Audio (dialogue)</th><th>Status</th></tr></thead>';
         const body = document.createElement('tbody'); table.appendChild(body);
         const addParts = (cell, parts) => parts.forEach(part => {
           const span = document.createElement('span');
@@ -852,8 +872,21 @@ HTML_PAGE = """
           const row = document.createElement('tr');
           const number = document.createElement('td'); number.className = 'line-number'; number.textContent = line.line;
           const storyboardCell = document.createElement('td'); addParts(storyboardCell, line.storyboard_parts || []);
-          const transcriptCell = document.createElement('td'); addParts(transcriptCell, line.transcript_parts || []);
-          row.append(number, storyboardCell, transcriptCell); body.appendChild(row);
+          const transcriptCell = document.createElement('td');
+          const cues = line.audio_cues || [];
+          if (cues.length) {
+            cues.forEach(cue => {
+              const cueBlock = document.createElement('div'); cueBlock.className = 'audio-cue';
+              const time = document.createElement('small');
+              time.textContent = cue.start != null ? ('[' + Number(cue.start).toFixed(2) + '–' + Number(cue.end).toFixed(2) + '] ') : '';
+              cueBlock.appendChild(time);
+              addParts(cueBlock, cue.transcript_parts || [{text: cue.text || '', kind: 'extra'}]);
+              transcriptCell.appendChild(cueBlock);
+            });
+          } else { transcriptCell.textContent = 'No audio cue aligned'; }
+          const status = document.createElement('td'); status.textContent = line.status === 'matched' ? 'Matched' : line.status === 'extra' ? 'Audio not in storyboard' : 'Review';
+          status.className = 'shot-status ' + line.status;
+          row.append(number, storyboardCell, transcriptCell, status); body.appendChild(row);
         });
         details.appendChild(table);
         validationCell.appendChild(details);

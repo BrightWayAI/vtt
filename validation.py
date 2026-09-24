@@ -104,39 +104,98 @@ def _word_diff_counts(expected, actual):
     return missing, extra
 
 
+def _cue_text(cue):
+    if isinstance(cue, dict):
+        return html.unescape(cue.get('text', '')).replace('\n', ' ').strip()
+    if isinstance(cue, (tuple, list)):
+        return html.unescape(cue[2]).replace('\n', ' ').strip()
+    return str(cue).strip()
+
+
+def _cue_record(cue, index):
+    if isinstance(cue, dict):
+        return {'cue': index, 'start': cue.get('start'), 'end': cue.get('end'),
+                'text': _cue_text(cue)}
+    return {'cue': index, 'start': cue[0], 'end': cue[1], 'text': _cue_text(cue)}
+
+
+def _range_score(expected, actual):
+    expected_tokens, actual_tokens = tokens(expected), tokens(actual)
+    if not expected_tokens or not actual_tokens:
+        return 0.0
+    ratio = SequenceMatcher(None, expected_tokens, actual_tokens, autojunk=False).ratio()
+    # Prefer a complete thought over a tiny matching fragment, while allowing
+    # natural ASR cue splits and a little ad-libbed audio.
+    length_penalty = min(0.25, abs(len(expected_tokens) - len(actual_tokens)) / max(len(expected_tokens), 1) * 0.15)
+    return ratio - length_penalty
+
+
+def _align_shots(expected_lines, cues):
+    """Map each storyboard shot to one or more adjacent transcript cues."""
+    records = [_cue_record(cue, i + 1) for i, cue in enumerate(cues)]
+    rows, cursor = [], 0
+    for shot_number, expected in enumerate(expected_lines, 1):
+        remaining_shots = len(expected_lines) - shot_number
+        if cursor >= len(records):
+            rows.append({'line': shot_number, 'status': 'review', 'storyboard': expected,
+                         'transcript': '', 'audio_cues': [], 'storyboard_parts': _word_parts(expected, '')[0],
+                         'transcript_parts': []})
+            continue
+        max_end = len(records) - remaining_shots
+        # A shot normally spans only a handful of cues. The cap prevents a
+        # corrupt ASR result from swallowing the remainder of the storyboard.
+        max_end = min(max_end, cursor + 12)
+        best_end, best_score = cursor + 1, -1.0
+        for end in range(cursor + 1, max_end + 1):
+            actual = ' '.join(record['text'] for record in records[cursor:end])
+            score = _range_score(expected, actual)
+            if score > best_score:
+                best_end, best_score = end, score
+        selected = records[cursor:best_end]
+        actual = ' '.join(record['text'] for record in selected)
+        expected_parts, actual_parts = _word_parts(expected, actual)
+        missing, extra = _word_diff_counts(expected, actual)
+        for record in selected:
+            cue_expected_parts, cue_actual_parts = _word_parts(expected, record['text'])
+            record['transcript_parts'] = cue_actual_parts
+        rows.append({'line': shot_number, 'status': 'matched' if not missing and not extra else 'review',
+                     'storyboard': expected, 'transcript': actual, 'audio_cues': selected,
+                     'storyboard_parts': expected_parts, 'transcript_parts': actual_parts,
+                     'missing': missing, 'extra': extra})
+        cursor = best_end
+    if cursor < len(records):
+        rows.append({'line': len(rows) + 1, 'status': 'extra', 'storyboard': '',
+                     'transcript': ' '.join(r['text'] for r in records[cursor:]),
+                     'audio_cues': records[cursor:], 'storyboard_parts': [],
+                     'transcript_parts': [{'text': _cue_text(r), 'kind': 'extra'} for r in records[cursor:]]})
+    return rows
+
+
 def storyboard_check(transcript, storyboard):
     if not storyboard or not tokens(storyboard):
         return {'status': 'unavailable', 'message': 'Storyboard not checked: no readable dialogue was available.'}
     expected_lines = extract_storyboard_vo_lines(storyboard) or [line.strip() for line in storyboard.splitlines() if line.strip()]
-    actual_lines = transcript if isinstance(transcript, list) else [line.strip() for line in transcript.splitlines() if line.strip()]
-    expected_keys = [' '.join(tokens(line)) for line in expected_lines]
-    actual_keys = [' '.join(tokens(line)) for line in actual_lines]
-    matcher = SequenceMatcher(None, expected_keys, actual_keys, autojunk=False)
-    rows = []
-    missing = extra = 0
-    for tag, i, j, k, l in matcher.get_opcodes():
-        count = max(j - i, l - k)
-        for offset in range(count):
-            expected = expected_lines[i + offset] if i + offset < j else ''
-            actual = actual_lines[k + offset] if k + offset < l else ''
-            expected_parts, actual_parts = _word_parts(expected, actual)
-            line_missing, line_extra = _word_diff_counts(expected, actual)
-            missing += line_missing
-            extra += line_extra
-            rows.append({'line': len(rows) + 1, 'status': 'matched' if tag == 'equal' else 'review',
-                         'storyboard': expected, 'transcript': actual,
-                         'storyboard_parts': expected_parts, 'transcript_parts': actual_parts})
+    if isinstance(transcript, list) and transcript and isinstance(transcript[0], (dict, tuple, list)):
+        cues = transcript
+    else:
+        lines = transcript if isinstance(transcript, list) else [line.strip() for line in transcript.splitlines() if line.strip()]
+        cues = [{'start': None, 'end': None, 'text': line} for line in lines]
+    rows = _align_shots(expected_lines, cues)
+    missing = sum(row.get('missing', 0) for row in rows)
+    extra = sum(row.get('extra', 0) for row in rows)
+    # Any audio before/after the storyboard is useful to reviewers, but is not
+    # treated as a missing storyboard shot.
+    extra += sum(len(tokens(cue['text'])) for row in rows if row['status'] == 'extra' for cue in row.get('audio_cues', []))
     status = 'matched' if not missing and not extra else 'review'
-    return {'status': status, 'storyboard_lines': len(expected_lines), 'transcript_lines': len(actual_lines),
+    return {'status': status, 'storyboard_lines': len(expected_lines), 'transcript_lines': len(cues),
             'missing_or_changed_words': missing, 'extra_or_changed_words': extra, 'lines': rows,
             'message': 'Storyboard VO matches the recognized transcript.' if status == 'matched' else
                 f'Storyboard VO review: {missing} storyboard words and {extra} audio words differ. Audio transcript retained.'}
 
 
 def check_output(cues, storyboard):
-    transcript_lines = [html.unescape(text).replace('\n', ' ').strip() for _, _, text in cues]
     report = quality_report([{'start': s, 'end': e, 'text': html.unescape(t)} for s, e, t in cues])
-    report['storyboard'] = storyboard_check(transcript_lines, storyboard)
+    report['storyboard'] = storyboard_check(cues, storyboard)
     report['timing'] = 'passed'
     return report
 def report_summary(report):

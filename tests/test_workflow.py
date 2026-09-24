@@ -54,6 +54,20 @@ Pacing Guidance: Keep it moving.
         self.assertEqual(report['missing_or_changed_words'], 1)
         self.assertEqual(report['extra_or_changed_words'], 1)
 
+    def test_one_storyboard_shot_can_span_multiple_audio_cues(self):
+        report = storyboard_check([
+            (1.0, 2.0, 'This is Susan B.'),
+            (2.0, 4.0, 'Anthony speaking today.'),
+        ], 'This is Susan B. Anthony speaking today.')
+        self.assertEqual(report['status'], 'matched')
+        self.assertEqual(len(report['lines']), 1)
+        self.assertEqual(len(report['lines'][0]['audio_cues']), 2)
+        self.assertEqual(report['lines'][0]['audio_cues'][1]['start'], 2.0)
+
+    def test_markup_like_asr_output_is_rejected(self):
+        self.assertTrue(main.contains_transcription_artifact('desserts</font></font>'))
+        self.assertFalse(main.contains_transcription_artifact('Susan B. Anthony'))
+
     def test_processing_has_no_delivery_side_effects(self):
         with patch.object(main,'transcribe_file',return_value=VTT), patch.object(main,'fetch_airtable_record',return_value=('record','Topic','url')), patch.object(main,'fetch_storyboard_vo',return_value='The ship enters the canal.'), patch('pathlib.Path.write_text',side_effect=AssertionError('Unexpected file write')), patch('httpx.Client.post',side_effect=AssertionError('Unexpected POST')), patch('httpx.Client.patch',side_effect=AssertionError('Unexpected PATCH')):
             result=main.process_media_file('unused','107_video.mp4')
