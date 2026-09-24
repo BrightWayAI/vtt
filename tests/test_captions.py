@@ -145,6 +145,18 @@ class CaptionsTest(unittest.TestCase):
         from pathlib import Path
         self.assertFalse(Path(process.call_args.args[0]).exists())
 
+    def test_large_upload_is_streamed_and_limit_is_configurable(self):
+        from fastapi.testclient import TestClient
+        old_limit = main.MAX_UPLOAD_SIZE
+        main.MAX_UPLOAD_SIZE = 2
+        try:
+            with patch.object(main, 'require_openai_api_key'):
+                response = TestClient(main.app).post('/transcribe', files={'file': ('large.mp4', b'12345')})
+        finally:
+            main.MAX_UPLOAD_SIZE = old_limit
+        self.assertEqual(response.status_code, 413)
+        self.assertIn('upload limit', response.json()['detail'])
+
     def test_malformed_timestamp_cannot_be_ignored(self):
         vtt='WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nSome valid words\n\nBAD --> BAD\nMissing caption\n'
         self.assertFalse(main.validate_vtt_output(vtt,5)[0])

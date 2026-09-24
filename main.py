@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500 MB for direct uploads
+MAX_UPLOAD_SIZE = int(os.environ.get("MAX_UPLOAD_SIZE_BYTES", str(2 * 1024 * 1024 * 1024)))
 CHUNK_DURATION_MS = 10 * 60 * 1000   # 10 minutes per Whisper chunk
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
@@ -1122,18 +1122,23 @@ async def index():
 @app.post("/transcribe")
 async def transcribe(request: Request, file: UploadFile = File(...)):
     require_openai_api_key()
-    contents = await file.read()
-    if len(contents) > MAX_UPLOAD_SIZE:
-        raise HTTPException(status_code=413, detail="File exceeds 500 MB limit.")
-
     original_name = file.filename or "unknown"
     suffix = Path(file.filename).suffix if file.filename else ".mp4"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    file_size = 0
     try:
-        tmp.write(contents)
+        while chunk := await file.read(1024 * 1024):
+            file_size += len(chunk)
+            if file_size > MAX_UPLOAD_SIZE:
+                tmp.close()
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File exceeds the {MAX_UPLOAD_SIZE / 1024 / 1024 / 1024:.0f} GB upload limit.",
+                )
+            tmp.write(chunk)
         tmp.close()
         ip = request.client.host if request.client else None
-        result = await run_in_threadpool(process_media_file, tmp.name, original_name, len(contents), ip)
+        result = await run_in_threadpool(process_media_file, tmp.name, original_name, file_size, ip)
 
         out_name = Path(original_name).stem + ".vtt"
         resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
