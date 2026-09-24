@@ -20,7 +20,7 @@ Validation runs before delivery:
 - Recognized words must survive rendering unchanged; readability exceptions are reported.
 - Full storyboard dialogue is compared against the transcript. Missing/changed/extra words are flagged for review, without rewriting the audio transcript. A missing or unreadable storyboard is explicitly marked as not checked.
 
-For numbered video filenames, `AIRTABLE_TOKEN` enables a read-only lookup of the linked Google Doc; the document must be readable by the server. A single-video upload or URL request can also provide `storyboard_text` (the UI has a paste field). Batch items independently look up their own storyboard. Validation summaries appear beside downloads and in `X-Validation-Summary`; detailed results travel inside a non-displaying WebVTT `NOTE` block, so no second file is created.
+For numbered video filenames, `AIRTABLE_TOKEN` automatically performs a read-only lookup of the linked Google Doc; the document must be readable by the server. Every upload and URL job uses that storyboard when available and compares the full VO against the transcript. There is no storyboard upload step. Batch items independently look up their own storyboard. Validation summaries appear beside downloads and in `X-Validation-Summary`; detailed results travel inside a non-displaying WebVTT `NOTE` block, so no second file is created.
 
 To benchmark audio directly:
 

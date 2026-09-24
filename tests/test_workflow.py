@@ -19,8 +19,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn('A ship',text)
 
     def test_storyboard_mismatch_is_review_not_replacement(self):
-        with patch.object(main,'transcribe_file',return_value=VTT):
-            result=main.process_media_file('unused','video.mp4',storyboard_text='The train enters the station.')
+        with patch.object(main,'transcribe_file',return_value=VTT), \
+             patch.object(main,'fetch_airtable_record',return_value=('record','Topic','url')), \
+             patch.object(main,'fetch_storyboard_vo',return_value='The train enters the station.'):
+            result=main.process_media_file('unused','107_video.mp4')
         self.assertIn('The ship enters the canal.',result['vtt_text'])
         self.assertIn('Storyboard review',result['validation'])
         self.assertIn('NOTE Validation',result['vtt_text'])
@@ -39,12 +41,22 @@ class WorkflowTests(unittest.TestCase):
         for forbidden in ['generate_thumbnail','save_to_upload_folder','update_upload_date','write_to_upload_sheet','get_db','save_transcription']:
             self.assertFalse(hasattr(main,forbidden))
 
-    def test_upload_passes_storyboard_and_returns_validation(self):
-        with patch.object(main,'require_openai_api_key'), patch.object(main,'transcribe_file',return_value=VTT):
-            response=TestClient(main.app).post('/transcribe',files={'file':('test.mp4',b'media')},data={'storyboard_text':'The ship enters the canal.'})
+    def test_upload_uses_automatic_storyboard_and_returns_validation(self):
+        with patch.object(main,'require_openai_api_key'), patch.object(main,'transcribe_file',return_value=VTT), \
+             patch.object(main,'fetch_airtable_record',return_value=('record','Topic','url')), \
+             patch.object(main,'fetch_storyboard_vo',return_value='The ship enters the canal.'):
+            response=TestClient(main.app).post('/transcribe',files={'file':('107_test.mp4',b'media')})
         self.assertEqual(response.status_code,200)
         self.assertIn('Storyboard matches',response.headers['X-Validation-Summary'])
         self.assertNotIn('X-Thumbnail-URL',response.headers)
+
+    def test_upload_automatically_uses_filename_id_for_storyboard(self):
+        with patch.object(main,'require_openai_api_key'), patch.object(main,'transcribe_file',return_value=VTT), \
+             patch.object(main,'fetch_airtable_record',return_value=('record','Topic','url')) as lookup, \
+             patch.object(main,'fetch_storyboard_vo',return_value='The ship enters the canal.'):
+            response=TestClient(main.app).post('/transcribe',files={'file':('107_test.mp4',b'media')})
+        lookup.assert_called_once_with(107)
+        self.assertIn('Storyboard matches',response.headers['X-Validation-Summary'])
 
     def test_batch_returns_downloadable_vtt_without_database(self):
         with tempfile.NamedTemporaryFile(delete=False) as tmp:

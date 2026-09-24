@@ -538,14 +538,17 @@ def download_url_to_temp(url: str) -> tuple[str, str, int]:
 
 
 def process_media_file(file_path: str, filename: str, file_size: int = 0,
-                       ip: str | None = None, storyboard_text: str | None = None) -> dict:
-    """Generate one VTT. External integrations are read-only storyboard lookups."""
-    if storyboard_text and storyboard_text.strip():
-        storyboard_text = extract_storyboard_dialogue(storyboard_text) or storyboard_text.strip()
-    else:
-        video_id = extract_video_id(filename)
-        record = fetch_airtable_record(video_id) if video_id is not None else None
-        storyboard_text = fetch_storyboard_vo(record[2]) if record else None
+                       ip: str | None = None) -> dict:
+    """Generate one VTT and validate it against the video's Airtable storyboard."""
+    video_id = extract_video_id(filename)
+    record = fetch_airtable_record(video_id) if video_id is not None else None
+    storyboard_text = fetch_storyboard_vo(record[2]) if record else None
+    if video_id is None:
+        logger.warning("No video ID found in filename %s; storyboard check unavailable", filename)
+    elif record is None:
+        logger.warning("No Airtable storyboard record found for video ID %s", video_id)
+    elif not storyboard_text:
+        logger.warning("Airtable record for video ID %s has no readable VO storyboard", video_id)
     vtt_text = transcribe_file(file_path, vo_prompt=storyboard_text)
     report = check_output(parse_vtt_cues(vtt_text), storyboard_text)
     return {"filename": Path(filename).stem + ".vtt",
@@ -620,9 +623,6 @@ HTML_PAGE = """
 <div class="container">
   <h1>VTT Generator</h1>
   <p class="sub">Generate cleaner subtitle files (.vtt) with steadier cue timing</p>
-
-  <label for="storyboard">Storyboard dialogue for a single video (optional; batches look up each video ID)</label>
-  <textarea id="storyboard" placeholder="Paste spoken dialogue from the storyboard"></textarea>
 
   <div class="tabs">
     <div class="tab active" data-tab="file">File Upload</div>
@@ -727,7 +727,6 @@ HTML_PAGE = """
     try {
       const fd = new FormData();
       fd.append('file', file);
-      fd.append('storyboard_text', document.getElementById('storyboard').value);
       const res = await fetch('/transcribe', { method: 'POST', body: fd });
       if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Transcription failed'); }
       const blob = await res.blob();
@@ -756,7 +755,7 @@ HTML_PAGE = """
     urlStatus.className = 'status';
     urlStatus.textContent = 'Downloading and transcribing…';
     try {
-      const body = 'url=' + encodeURIComponent(url) + '&storyboard_text=' + encodeURIComponent(document.getElementById('storyboard').value);
+      const body = 'url=' + encodeURIComponent(url);
       const res = await fetch('/transcribe-url', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -922,7 +921,7 @@ async def index():
 
 
 @app.post("/transcribe")
-async def transcribe(request: Request, file: UploadFile = File(...), storyboard_text: str = Form("")):
+async def transcribe(request: Request, file: UploadFile = File(...)):
     require_openai_api_key()
     contents = await file.read()
     if len(contents) > MAX_UPLOAD_SIZE:
@@ -935,7 +934,7 @@ async def transcribe(request: Request, file: UploadFile = File(...), storyboard_
         tmp.write(contents)
         tmp.close()
         ip = request.client.host if request.client else None
-        result = await run_in_threadpool(process_media_file, tmp.name, original_name, len(contents), ip, storyboard_text)
+        result = await run_in_threadpool(process_media_file, tmp.name, original_name, len(contents), ip)
 
         out_name = Path(original_name).stem + ".vtt"
         resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
@@ -946,7 +945,7 @@ async def transcribe(request: Request, file: UploadFile = File(...), storyboard_
 
 
 @app.post("/transcribe-url")
-async def transcribe_url(request: Request, url: str = Form(...), storyboard_text: str = Form("")):
+async def transcribe_url(request: Request, url: str = Form(...)):
     require_openai_api_key()
     try:
         file_path, filename, file_size = await run_in_threadpool(download_url_to_temp, url)
@@ -957,7 +956,7 @@ async def transcribe_url(request: Request, url: str = Form(...), storyboard_text
 
     try:
         ip = request.client.host if request.client else None
-        result = await run_in_threadpool(process_media_file, file_path, filename, file_size, ip, storyboard_text)
+        result = await run_in_threadpool(process_media_file, file_path, filename, file_size, ip)
 
         out_name = Path(filename).stem + ".vtt"
         resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
