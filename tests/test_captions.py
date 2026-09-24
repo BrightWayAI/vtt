@@ -105,6 +105,22 @@ class CaptionsTest(unittest.TestCase):
         self.assertEqual([s['text'] for s in segments],['Look at that costume!','Main narration.'])
         self.assertEqual(segments[0]['start'],1.)
 
+    def test_riptoes_opening_is_added_only_when_audio_confirms_phrase(self):
+        result = SimpleNamespace(
+            words=[SimpleNamespace(word='Where\'d', start=2., end=2.4),
+                   SimpleNamespace(word='you', start=2.4, end=2.7),
+                   SimpleNamespace(word='go', start=2.7, end=3.),
+                   SimpleNamespace(word='this', start=3., end=3.3),
+                   SimpleNamespace(word='time', start=3.3, end=3.7),
+                   SimpleNamespace(word='Riptoes', start=3.7, end=4.2)],
+            segments=[SimpleNamespace(start=2., end=4.2, text="Where'd you go this time, Riptoes?")],
+        )
+        with patch.object(main, 'transcribe_audio_clip', return_value=result):
+            words, segments = main.recover_riptoes_opening(Mock(), AudioSegment.silent(duration=10000))
+        self.assertEqual(segments[0]['text'], "Where'd you go this time, Riptoes?")
+        self.assertEqual(segments[0]['start'], 0.)
+        self.assertTrue(words)
+
     def test_chunk_offsets_and_contiguous_coverage(self):
         audio=AudioSegment.silent(duration=5000)
         with patch.object(main,'CHUNK_DURATION_MS',2000):

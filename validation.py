@@ -1,7 +1,6 @@
 """Read-only checks. Storyboards are references, never replacement transcripts."""
 from difflib import SequenceMatcher
 import html
-import json
 import re
 from captions import tokens, quality_report
 
@@ -55,14 +54,6 @@ def check_output(cues, storyboard):
     report['storyboard'] = storyboard_check(transcript, storyboard)
     report['timing'] = 'passed'
     return report
-
-
 def report_summary(report):
     reading = report['short_cues'] + report['fast_cues'] + report['long_lines']
     return f"Timing passed. Readability: {'review needed' if reading else 'passed'}. " + report['storyboard']['message']
-
-
-def attach_report(vtt, report):
-    # WebVTT NOTE blocks are ignored by caption players but travel with the file.
-    note = json.dumps(report, ensure_ascii=True).replace('-->', '--\\u003e')
-    return vtt.rstrip() + '\n\nNOTE Validation\n' + note + '\n\n'

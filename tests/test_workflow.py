@@ -25,7 +25,7 @@ class WorkflowTests(unittest.TestCase):
             result=main.process_media_file('unused','107_video.mp4')
         self.assertIn('The ship enters the canal.',result['vtt_text'])
         self.assertIn('Storyboard review',result['validation'])
-        self.assertIn('NOTE Validation',result['vtt_text'])
+        self.assertNotIn('NOTE Validation',result['vtt_text'])
         self.assertTrue(main.validate_vtt_output(result['vtt_text'],3)[0])
 
     def test_absent_storyboard_is_not_a_pass(self):
@@ -57,6 +57,15 @@ class WorkflowTests(unittest.TestCase):
             response=TestClient(main.app).post('/transcribe',files={'file':('107_test.mp4',b'media')})
         lookup.assert_called_once_with(107)
         self.assertIn('Storyboard matches',response.headers['X-Validation-Summary'])
+
+    def test_ui_supports_multi_file_upload_and_keeps_vtt_clean(self):
+        self.assertIn('id="file-input" multiple', main.HTML_PAGE)
+        self.assertNotIn('id="storyboard"', main.HTML_PAGE)
+        with patch.object(main,'transcribe_file',return_value=VTT), \
+             patch.object(main,'fetch_airtable_record',return_value=None):
+            result=main.process_media_file('unused','107_video.mp4')
+        self.assertNotIn('NOTE Validation', result['vtt_text'])
+        self.assertTrue(result['vtt_text'].startswith('WEBVTT'))
 
     def test_batch_returns_downloadable_vtt_without_database(self):
         with tempfile.NamedTemporaryFile(delete=False) as tmp:

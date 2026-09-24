@@ -14,13 +14,15 @@ Transcription uses `whisper-1` word and segment timestamps. Output has no word h
 
 The web workflow only returns a VTT file. It does not generate thumbnails, write delivery-folder copies, store database history, or update Airtable/Google Sheets. Temporary media is deleted after processing. Batch downloads work directly in the browser without a database.
 
+The File Upload tab accepts multiple files and processes them one at a time, returning one VTT download per input. The separate batch tab supports the same workflow plus URL lists.
+
 Validation runs before delivery:
 
 - Timestamp bounds, ordering, non-overlap, and valid WebVTT structure.
 - Recognized words must survive rendering unchanged; readability exceptions are reported.
-- Full storyboard dialogue is compared against the transcript. Missing/changed/extra words are flagged for review, without rewriting the audio transcript. A missing or unreadable storyboard is explicitly marked as not checked.
+- Full storyboard dialogue is compared against the transcript. Missing/changed/extra words are flagged in the UI, without rewriting the audio transcript. A missing or unreadable storyboard is explicitly marked as not checked.
 
-For numbered video filenames, `AIRTABLE_TOKEN` automatically performs a read-only lookup of the linked Google Doc; the document must be readable by the server. Every upload and URL job uses that storyboard when available and compares the full VO against the transcript. There is no storyboard upload step. Batch items independently look up their own storyboard. Validation summaries appear beside downloads and in `X-Validation-Summary`; detailed results travel inside a non-displaying WebVTT `NOTE` block, so no second file is created.
+For numbered video filenames, `AIRTABLE_TOKEN` automatically performs a read-only lookup of the linked Google Doc; the document must be readable by the server. Every upload and URL job uses that storyboard when available and compares the full VO against the transcript. There is no storyboard upload step. Batch items independently look up their own storyboard. Validation details appear in the UI and in the `X-Validation-Report` response header; the downloaded VTT contains captions only.
 
 To benchmark audio directly:
 

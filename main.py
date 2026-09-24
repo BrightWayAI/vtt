@@ -15,7 +15,7 @@ from pydub import AudioSegment
 from openai import OpenAI
 from captions import render as render_phrase_captions, tokens as caption_tokens
 from starlette.concurrency import run_in_threadpool
-from validation import extract_storyboard_dialogue, check_output, report_summary, attach_report
+from validation import extract_storyboard_dialogue, check_output, report_summary
 import html
 
 logging.basicConfig(level=logging.INFO)
@@ -35,6 +35,11 @@ CAPTION_CLEANUP_BATCH_CHARS = 2500
 TRANSCRIPTION_MAX_ATTEMPTS = 2
 MIN_VALID_CUE_DURATION_S = 0.05
 MIN_VALID_TEXT_CHARS = 8
+
+RIPTOES_OPENING_RE = re.compile(
+    r"where(?:'|’)?d\s+you\s+go\s+this\s+time,?\s+riptoes\b",
+    re.IGNORECASE,
+)
 
 AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE_ID = "appf82sOr6qFvVj6z"
@@ -366,6 +371,31 @@ def transcribe_audio_clip(client, audio, prompt=None):
             os.unlink(tmp.name)
 
 
+def recover_riptoes_opening(client, audio_orig):
+    """Recover the spoken canned opening only when a fresh audio pass hears it."""
+    pad = AudioSegment.silent(duration=2000, frame_rate=16000)
+    result = transcribe_audio_clip(
+        client, pad + audio_orig[:15000], prompt="Where'd you go this time Riptoes"
+    )
+    result_segments = getattr(result, "segments", None) or []
+    confirmed = next(
+        (seg for seg in result_segments if RIPTOES_OPENING_RE.search(seg.text or "")),
+        None,
+    )
+    if confirmed is None:
+        return None
+    start = max(0.0, confirmed.start - 2.0)
+    end = max(start + 0.05, confirmed.end - 2.0)
+    words = [
+        {"word": word.word, "start": max(0.0, word.start - 2.0),
+         "end": max(0.0, word.end - 2.0)}
+        for word in (getattr(result, "words", None) or [])
+        if word.start < confirmed.end and word.end > confirmed.start
+    ]
+    return words, [{"start": start, "end": end,
+                    "text": "Where'd you go this time, Riptoes?"}]
+
+
 def audio_chunk_ranges(audio):
     """Prefer a nearby quiet boundary over cutting a word at exactly 10 minutes."""
     from pydub.silence import detect_silence
@@ -425,6 +455,20 @@ def collect_transcription_data(
                 logger.info("Recovered %s opening speech segments from audio", len(recovered))
         except Exception as exc:
             logger.warning("Opening audio recheck failed; retaining original transcript: %s", exc)
+
+    opening_text = " ".join(seg.get("text", "") for seg in segments if seg.get("start", 0) < 10)
+    if not RIPTOES_OPENING_RE.search(opening_text):
+        try:
+            recovered = recover_riptoes_opening(client, audio_orig)
+            if recovered:
+                opening_words, opening_segments = recovered
+                segments = [seg for seg in segments if seg["start"] >= 10]
+                words = [word for word in words if word["start"] >= 10]
+                segments = sorted(opening_segments + segments, key=lambda seg: seg["start"])
+                words = sorted(opening_words + words, key=lambda word: word["start"])
+                logger.info("Confirmed and restored the Riptoes opening from audio")
+        except Exception as exc:
+            logger.warning("Riptoes opening check failed; retaining recognized transcript: %s", exc)
     return words, segments
 
 
@@ -552,7 +596,9 @@ def process_media_file(file_path: str, filename: str, file_size: int = 0,
     vtt_text = transcribe_file(file_path, vo_prompt=storyboard_text)
     report = check_output(parse_vtt_cues(vtt_text), storyboard_text)
     return {"filename": Path(filename).stem + ".vtt",
-            "vtt_text": attach_report(vtt_text, report), "validation": report_summary(report)}
+            "vtt_text": vtt_text,
+            "validation": report_summary(report),
+            "validation_report": report}
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +645,7 @@ HTML_PAGE = """
   .status { margin-top: 1rem; font-size: 0.9rem; text-align: center; }
   .status.error { color: #ff6b6b; }
   .status.success a { color: #4a9eff; text-decoration: none; font-weight: 600; }
+  .validation { display: block; margin-top: 0.5rem; color: #aaa; font-size: 0.8rem; text-align: left; white-space: pre-wrap; }
 
   .batch-log { margin-top: 1rem; font-size: 0.85rem; max-height: 300px; overflow-y: auto; }
   .batch-section { margin-bottom: 1.25rem; }
@@ -636,7 +683,7 @@ HTML_PAGE = """
       <label class="file-label" id="drop-label" for="file-input">
         <span id="label-text">Click to select or drag a file here</span>
         <div class="file-name" id="file-name"></div>
-        <input type="file" id="file-input" accept="video/*,audio/*,.mp3,.mp4,.m4a,.wav,.webm,.ogg,.flac,.mpeg,.mpga">
+        <input type="file" id="file-input" multiple accept="video/*,audio/*,.mp3,.mp4,.m4a,.wav,.webm,.ogg,.flac,.mpeg,.mpga">
       </label>
       <button type="submit" id="file-btn" disabled>Generate VTT</button>
     </form>
@@ -699,42 +746,69 @@ HTML_PAGE = """
   const fileBtn = document.getElementById('file-btn');
   const fileStatus = document.getElementById('file-status');
 
-  function setFile(file) {
+  function setFiles(files) {
     const dt = new DataTransfer();
-    dt.items.add(file);
+    Array.from(files).forEach(file => dt.items.add(file));
     fileInput.files = dt.files;
-    fileNameEl.textContent = file.name + ' (' + (file.size / 1024 / 1024).toFixed(1) + ' MB)';
+    const totalMb = Array.from(files).reduce((sum, file) => sum + file.size, 0) / 1024 / 1024;
+    fileNameEl.textContent = files.length + ' file' + (files.length === 1 ? '' : 's') + ' (' + totalMb.toFixed(1) + ' MB)';
     label.classList.add('has-file');
-    fileBtn.disabled = false;
+    fileBtn.disabled = files.length === 0;
   }
 
-  fileInput.addEventListener('change', () => { if (fileInput.files.length) setFile(fileInput.files[0]); });
+  function validationText(raw) {
+    if (!raw) return '';
+    try {
+      const report = JSON.parse(raw);
+      const storyboard = report.storyboard || {};
+      let text = storyboard.message || 'Validation completed.';
+      if (storyboard.examples && storyboard.examples.length) {
+        text += String.fromCharCode(10) + storyboard.examples.map(x => 'Storyboard: ' + x.storyboard + String.fromCharCode(10) + 'Audio: ' + x.audio).join(String.fromCharCode(10));
+      }
+      return text;
+    } catch (_) { return raw; }
+  }
+
+  function addValidation(container, raw) {
+    const text = validationText(raw);
+    if (!text) return;
+    const detail = document.createElement('span');
+    detail.className = 'validation';
+    detail.textContent = text;
+    container.appendChild(detail);
+  }
+
+  fileInput.addEventListener('change', () => setFiles(fileInput.files));
 
   label.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); label.classList.add('dragover'); });
   label.addEventListener('dragleave', (e) => { e.preventDefault(); e.stopPropagation(); label.classList.remove('dragover'); });
   label.addEventListener('drop', (e) => {
     e.preventDefault(); e.stopPropagation(); label.classList.remove('dragover');
-    if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
+    if (e.dataTransfer.files.length) setFiles(e.dataTransfer.files);
   });
 
   fileForm.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const file = fileInput.files[0];
-    if (!file) return;
+    const files = Array.from(fileInput.files || []);
+    if (!files.length) return;
     fileBtn.disabled = true;
     fileStatus.className = 'status';
-    fileStatus.textContent = 'Transcribing… this may take a few minutes for large files.';
+    fileStatus.textContent = 'Transcribing ' + files.length + ' file' + (files.length === 1 ? '' : 's') + '…';
     try {
-      const fd = new FormData();
-      fd.append('file', file);
-      const res = await fetch('/transcribe', { method: 'POST', body: fd });
-      if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Transcription failed'); }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const name = file.name.replace(/\\.[^.]+$/, '') + '.vtt';
       fileStatus.className = 'status success';
-      fileStatus.innerHTML = '<a href="' + url + '" download="' + name + '">Download ' + name + '</a>';
-      fileStatus.append(document.createTextNode(' — ' + (res.headers.get('X-Validation-Summary') || '')));
+      fileStatus.innerHTML = '';
+      for (const file of files) {
+        const fd = new FormData();
+        fd.append('file', file);
+        const res = await fetch('/transcribe', { method: 'POST', body: fd });
+        if (!res.ok) { const err = await res.json(); throw new Error(file.name + ': ' + (err.detail || 'Transcription failed')); }
+        const url = URL.createObjectURL(await res.blob());
+        const name = file.name.replace(/\\.[^.]+$/, '') + '.vtt';
+        const link = document.createElement('a');
+        link.href = url; link.download = name; link.textContent = 'Download ' + name;
+        fileStatus.appendChild(link);
+        addValidation(fileStatus, res.headers.get('X-Validation-Report'));
+      }
     } catch (err) {
       fileStatus.className = 'status error';
       fileStatus.textContent = err.message;
@@ -769,7 +843,7 @@ HTML_PAGE = """
       const blobUrl = URL.createObjectURL(blob);
       urlStatus.className = 'status success';
       urlStatus.innerHTML = '<a href="' + blobUrl + '" download="' + name + '">Download ' + name + '</a>';
-      urlStatus.append(document.createTextNode(' — ' + (res.headers.get('X-Validation-Summary') || '')));
+      addValidation(urlStatus, res.headers.get('X-Validation-Report'));
     } catch (err) {
       urlStatus.className = 'status error';
       urlStatus.textContent = err.message;
@@ -861,7 +935,7 @@ HTML_PAGE = """
         const name = file.name.replace(/\\.[^.]+$/, '') + '.vtt';
         const links = '<a href="' + blobUrl + '" download="' + name + '">download VTT</a>';
         updateBatchState(i, 'done', 'done ' + links);
-        document.getElementById('bs-' + i)?.append(document.createTextNode(res.headers.get('X-Validation-Summary') || ''));
+        addValidation(document.getElementById('bs-' + i), res.headers.get('X-Validation-Report'));
       } catch (err) {
         updateBatchState(i, 'error', (err && err.message) ? err.message : 'error');
       }
@@ -899,7 +973,7 @@ HTML_PAGE = """
         const blobUrl = URL.createObjectURL(new Blob([d.vtt_text], {type: 'text/vtt'}));
         const link = 'done <a href="' + blobUrl + '" download="subtitles.vtt">download VTT</a>';
         updateBatchState(d.index, 'done', link);
-        document.getElementById('bs-' + d.index)?.append(document.createTextNode(d.validation || ''));
+        addValidation(document.getElementById('bs-' + d.index), JSON.stringify(d.validation_report || {}));
       } else if (d.status === 'error') {
         updateBatchState(d.index, 'error', d.message || 'error');
       } else if (d.status === 'complete') {
@@ -939,6 +1013,7 @@ async def transcribe(request: Request, file: UploadFile = File(...)):
         out_name = Path(original_name).stem + ".vtt"
         resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
         resp_headers["X-Validation-Summary"] = result.get("validation", "")
+        resp_headers["X-Validation-Report"] = json.dumps(result.get("validation_report", {}), ensure_ascii=True)
         return Response(content=result["vtt_text"], media_type="text/vtt", headers=resp_headers)
     finally:
         os.unlink(tmp.name)
@@ -961,6 +1036,7 @@ async def transcribe_url(request: Request, url: str = Form(...)):
         out_name = Path(filename).stem + ".vtt"
         resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
         resp_headers["X-Validation-Summary"] = result.get("validation", "")
+        resp_headers["X-Validation-Report"] = json.dumps(result.get("validation_report", {}), ensure_ascii=True)
         return Response(content=result["vtt_text"], media_type="text/vtt", headers=resp_headers)
     finally:
         os.unlink(file_path)
