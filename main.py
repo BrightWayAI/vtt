@@ -645,7 +645,19 @@ HTML_PAGE = """
   .status { margin-top: 1rem; font-size: 0.9rem; text-align: center; }
   .status.error { color: #ff6b6b; }
   .status.success a { color: #4a9eff; text-decoration: none; font-weight: 600; }
-  .validation { display: block; margin-top: 0.5rem; color: #aaa; font-size: 0.8rem; text-align: left; white-space: pre-wrap; }
+  .results-table { width: 100%; margin-top: 1rem; border-collapse: collapse; text-align: left; font-size: 0.8rem; }
+  .results-table th { color: #888; font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; padding: .55rem .45rem; border-bottom: 1px solid #333; }
+  .results-table td { padding: .7rem .45rem; border-bottom: 1px solid #292929; vertical-align: top; }
+  .results-table td:first-child { word-break: break-word; max-width: 170px; }
+  .results-table a { color: #4a9eff; font-weight: 600; text-decoration: none; white-space: nowrap; }
+  .validation-badge { display: inline-block; padding: .2rem .4rem; border-radius: 4px; font-size: .68rem; font-weight: 700; letter-spacing: .04em; }
+  .validation-badge.matched { color: #8ee0a8; background: rgba(70, 180, 100, .16); }
+  .validation-badge.review { color: #ffd27a; background: rgba(230, 160, 40, .16); }
+  .validation-badge.unavailable { color: #aaa; background: rgba(150, 150, 150, .14); }
+  .validation-detail { color: #aaa; margin-top: .35rem; line-height: 1.35; }
+  .validation-detail details { margin-top: .35rem; }
+  .validation-detail summary { color: #bbb; cursor: pointer; }
+  .validation-detail .diff { margin-top: .25rem; padding: .35rem; background: #111; border-radius: 4px; }
 
   .batch-log { margin-top: 1rem; font-size: 0.85rem; max-height: 300px; overflow-y: auto; }
   .batch-section { margin-bottom: 1.25rem; }
@@ -756,26 +768,68 @@ HTML_PAGE = """
     fileBtn.disabled = files.length === 0;
   }
 
-  function validationText(raw) {
-    if (!raw) return '';
+  function parseValidation(raw) {
+    if (!raw) return {};
     try {
-      const report = JSON.parse(raw);
-      const storyboard = report.storyboard || {};
-      let text = storyboard.message || 'Validation completed.';
-      if (storyboard.examples && storyboard.examples.length) {
-        text += String.fromCharCode(10) + storyboard.examples.map(x => 'Storyboard: ' + x.storyboard + String.fromCharCode(10) + 'Audio: ' + x.audio).join(String.fromCharCode(10));
-      }
-      return text;
-    } catch (_) { return raw; }
+      return JSON.parse(raw);
+    } catch (_) { return {storyboard: {status: 'review', message: raw}}; }
   }
 
-  function addValidation(container, raw) {
-    const text = validationText(raw);
-    if (!text) return;
-    const detail = document.createElement('span');
-    detail.className = 'validation';
-    detail.textContent = text;
-    container.appendChild(detail);
+  function createResultsTable(container) {
+    container.innerHTML = '';
+    const table = document.createElement('table');
+    table.className = 'results-table';
+    table.innerHTML = '<thead><tr><th>File</th><th>VTT</th><th>Validation</th></tr></thead>';
+    const body = document.createElement('tbody');
+    table.appendChild(body);
+    container.appendChild(table);
+    return body;
+  }
+
+  function fillValidationCell(validationCell, rawReport, error) {
+    const report = parseValidation(rawReport);
+    const storyboard = report.storyboard || {};
+    if (error) {
+      validationCell.textContent = error;
+    } else {
+      const status = storyboard.status || 'unavailable';
+      const badge = document.createElement('span');
+      badge.className = 'validation-badge ' + status;
+      badge.textContent = status === 'matched' ? 'MATCHED' : status === 'review' ? 'REVIEW' : 'NOT CHECKED';
+      validationCell.appendChild(badge);
+      const detail = document.createElement('div');
+      detail.className = 'validation-detail';
+      const readabilityIssues = (report.short_cues || 0) + (report.fast_cues || 0) + (report.long_lines || 0);
+      detail.textContent = (storyboard.message || 'Validation completed.') +
+        (readabilityIssues ? ' Readability needs review.' : ' Readability passed.');
+      validationCell.appendChild(detail);
+      if (storyboard.examples && storyboard.examples.length) {
+        const details = document.createElement('details');
+        const summary = document.createElement('summary'); summary.textContent = 'Show differences'; details.appendChild(summary);
+        storyboard.examples.forEach(example => {
+          const diff = document.createElement('div'); diff.className = 'diff';
+          diff.textContent = 'Storyboard: ' + example.storyboard + ' / Audio: ' + example.audio;
+          details.appendChild(diff);
+        });
+        validationCell.appendChild(details);
+      }
+    }
+  }
+
+  function addResultRow(body, filename, blobUrl, rawReport, error) {
+    const row = document.createElement('tr');
+    const fileCell = document.createElement('td');
+    fileCell.textContent = filename;
+    const linkCell = document.createElement('td');
+    if (blobUrl) {
+      const link = document.createElement('a');
+      link.href = blobUrl; link.download = filename.replace(/[^.]+$/, '') + 'vtt'; link.textContent = 'Download';
+      linkCell.appendChild(link);
+    } else { linkCell.textContent = 'Failed'; }
+    const validationCell = document.createElement('td');
+    fillValidationCell(validationCell, rawReport, error);
+    row.append(fileCell, linkCell, validationCell);
+    body.appendChild(row);
   }
 
   fileInput.addEventListener('change', () => setFiles(fileInput.files));
@@ -796,18 +850,14 @@ HTML_PAGE = """
     fileStatus.textContent = 'Transcribing ' + files.length + ' file' + (files.length === 1 ? '' : 's') + '…';
     try {
       fileStatus.className = 'status success';
-      fileStatus.innerHTML = '';
+      const resultBody = createResultsTable(fileStatus);
       for (const file of files) {
         const fd = new FormData();
         fd.append('file', file);
         const res = await fetch('/transcribe', { method: 'POST', body: fd });
         if (!res.ok) { const err = await res.json(); throw new Error(file.name + ': ' + (err.detail || 'Transcription failed')); }
         const url = URL.createObjectURL(await res.blob());
-        const name = file.name.replace(/\\.[^.]+$/, '') + '.vtt';
-        const link = document.createElement('a');
-        link.href = url; link.download = name; link.textContent = 'Download ' + name;
-        fileStatus.appendChild(link);
-        addValidation(fileStatus, res.headers.get('X-Validation-Report'));
+        addResultRow(resultBody, file.name, url, res.headers.get('X-Validation-Report'));
       }
     } catch (err) {
       fileStatus.className = 'status error';
@@ -842,8 +892,8 @@ HTML_PAGE = """
       const name = match ? match[1] : 'subtitles.vtt';
       const blobUrl = URL.createObjectURL(blob);
       urlStatus.className = 'status success';
-      urlStatus.innerHTML = '<a href="' + blobUrl + '" download="' + name + '">Download ' + name + '</a>';
-      addValidation(urlStatus, res.headers.get('X-Validation-Report'));
+      const resultBody = createResultsTable(urlStatus);
+      addResultRow(resultBody, name, blobUrl, res.headers.get('X-Validation-Report'));
     } catch (err) {
       urlStatus.className = 'status error';
       urlStatus.textContent = err.message;
@@ -868,11 +918,20 @@ HTML_PAGE = """
 
   function renderBatchItems(items) {
     batchLog.innerHTML = '';
+    const table = document.createElement('table');
+    table.className = 'results-table';
+    table.innerHTML = '<thead><tr><th>File</th><th>VTT</th><th>Validation</th></tr></thead>';
+    const body = document.createElement('tbody');
+    table.appendChild(body);
+    batchLog.appendChild(table);
     items.forEach((item, i) => {
-      const div = document.createElement('div');
-      div.className = 'batch-item';
-      div.innerHTML = '<span class="name" title="' + item.title + '">' + item.name + '</span><span class="state queued" id="bs-' + i + '">queued</span>';
-      batchLog.appendChild(div);
+      const row = document.createElement('tr');
+      const name = document.createElement('td'); name.textContent = item.name; name.title = item.title;
+      const download = document.createElement('td');
+      const state = document.createElement('span'); state.className = 'state queued'; state.id = 'bs-' + i; state.textContent = 'queued';
+      download.appendChild(state);
+      const validation = document.createElement('td'); validation.id = 'bv-' + i;
+      row.append(name, download, validation); body.appendChild(row);
     });
   }
 
@@ -881,6 +940,12 @@ HTML_PAGE = """
     if (!el) return;
     el.className = 'state ' + status;
     if (html !== undefined) el.innerHTML = html;
+  }
+
+  function setBatchValidation(index, raw) {
+    const cell = document.getElementById('bv-' + index);
+    if (!cell) return;
+    fillValidationCell(cell, raw);
   }
 
   function setBatchFiles(files) {
@@ -935,7 +1000,7 @@ HTML_PAGE = """
         const name = file.name.replace(/\\.[^.]+$/, '') + '.vtt';
         const links = '<a href="' + blobUrl + '" download="' + name + '">download VTT</a>';
         updateBatchState(i, 'done', 'done ' + links);
-        addValidation(document.getElementById('bs-' + i), res.headers.get('X-Validation-Report'));
+        setBatchValidation(i, res.headers.get('X-Validation-Report'));
       } catch (err) {
         updateBatchState(i, 'error', (err && err.message) ? err.message : 'error');
       }
@@ -973,7 +1038,7 @@ HTML_PAGE = """
         const blobUrl = URL.createObjectURL(new Blob([d.vtt_text], {type: 'text/vtt'}));
         const link = 'done <a href="' + blobUrl + '" download="subtitles.vtt">download VTT</a>';
         updateBatchState(d.index, 'done', link);
-        addValidation(document.getElementById('bs-' + d.index), JSON.stringify(d.validation_report || {}));
+        setBatchValidation(d.index, JSON.stringify(d.validation_report || {}));
       } else if (d.status === 'error') {
         updateBatchState(d.index, 'error', d.message || 'error');
       } else if (d.status === 'complete') {
