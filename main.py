@@ -29,9 +29,10 @@ app = FastAPI()
 MAX_UPLOAD_SIZE = int(os.environ.get("MAX_UPLOAD_SIZE_BYTES", str(2 * 1024 * 1024 * 1024)))
 CHUNK_DURATION_MS = 10 * 60 * 1000   # 10 minutes per Whisper chunk
 
-# GPT-4o Transcribe is the higher-accuracy replacement for Whisper. Keep the
-# environment override so deployments can fall back to whisper-1 if needed.
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "gpt-4o-transcribe")
+# Timed captions require verbose JSON with word/segment timestamps. Keep the
+# environment override for compatible models; incompatible aliases fall back
+# automatically to whisper-1 in transcribe_chunk().
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")
 CAPTION_CLEANUP_MODEL = os.environ.get("CAPTION_CLEANUP_MODEL", "gpt-4o-mini")
 ENABLE_CAPTION_CLEANUP = os.environ.get("ENABLE_CAPTION_CLEANUP", "0").lower() not in {"0", "false", "no"}
 
@@ -151,16 +152,29 @@ def fmt_ts(seconds: float) -> str:
 
 
 def transcribe_chunk(client: OpenAI, chunk_path: str, prompt: str | None = None):
-    with open(chunk_path, "rb") as f:
-        kwargs = dict(
-            model=WHISPER_MODEL,
-            file=f,
-            response_format="verbose_json",
-            timestamp_granularities=["word", "segment"],
-        )
-        if prompt:
-            kwargs["prompt"] = prompt[:900]
-        return client.audio.transcriptions.create(**kwargs)
+    def request(model):
+        with open(chunk_path, "rb") as f:
+            kwargs = dict(
+                model=model,
+                file=f,
+                response_format="verbose_json",
+                timestamp_granularities=["word", "segment"],
+            )
+            if prompt:
+                kwargs["prompt"] = prompt[:900]
+            return client.audio.transcriptions.create(**kwargs)
+
+    try:
+        return request(WHISPER_MODEL)
+    except Exception as exc:
+        # Some deployments expose a GPT transcribe alias that accepts only
+        # json/text and cannot provide the word/segment timing this generator
+        # needs. Retry once with Whisper's timestamp-capable endpoint.
+        message = str(exc).lower()
+        if WHISPER_MODEL != "whisper-1" and "verbose_json" in message and "not compatible" in message:
+            logger.warning("Model %s does not support timed verbose JSON; falling back to whisper-1", WHISPER_MODEL)
+            return request("whisper-1")
+        raise
 
 
 def normalize_caption_text(text: str) -> str:
