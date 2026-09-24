@@ -12,7 +12,17 @@ Transcription uses `whisper-1` word and segment timestamps. Output has no word h
 
 `ENABLE_CAPTION_CLEANUP` defaults to `0`. If enabled, cleanup can only change punctuation and case; edits that change words are rejected. Storyboard text is an optional transcription hint, not authoritative replacement dialogue.
 
-The web workflow may write delivered files and update configured Airtable/Sheets integrations. To test audio without those side effects:
+The web workflow only returns a VTT file. It does not generate thumbnails, write delivery-folder copies, store database history, or update Airtable/Google Sheets. Temporary media is deleted after processing. Batch downloads work directly in the browser without a database.
+
+Validation runs before delivery:
+
+- Timestamp bounds, ordering, non-overlap, and valid WebVTT structure.
+- Recognized words must survive rendering unchanged; readability exceptions are reported.
+- Full storyboard dialogue is compared against the transcript. Missing/changed/extra words are flagged for review, without rewriting the audio transcript. A missing or unreadable storyboard is explicitly marked as not checked.
+
+For numbered video filenames, `AIRTABLE_TOKEN` enables a read-only lookup of the linked Google Doc; the document must be readable by the server. A single-video upload or URL request can also provide `storyboard_text` (the UI has a paste field). Batch items independently look up their own storyboard. Validation summaries appear beside downloads and in `X-Validation-Summary`; detailed results travel inside a non-displaying WebVTT `NOTE` block, so no second file is created.
+
+To benchmark audio directly:
 
 ```sh
 python3 scripts/benchmark_videos.py /path/to/video.mp4 --output /tmp/vtt-benchmark

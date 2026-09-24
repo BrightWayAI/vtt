@@ -46,3 +46,10 @@ Whisper remains the timestamp source. The independent recognizer is a benchmark 
 - Historical repair scripts (`finalize_vtts_from_storyboards.py`, `repair_large_gaps_from_storyboard.py`, `replace_vtt_tails_with_audio.py`, `delivery_vtt_repair.py`) can replace dialogue from scripts or hardcoded text and allocate timing proportionally. They are separate from the service; do not use them as automated accuracy validation.
 - Existing upload routes combine caption generation with delivery-folder writes, thumbnail generation, and Airtable/Sheets updates. Test tools bypass these side effects. A future separation would make production QA safer and retries easier to reason about.
 - Other service audit items: unbounded URL download size, whole-upload memory buffering, unrestricted remote URLs, and unescaped filenames in history HTML. These were outside the caption-quality patch.
+
+
+## Follow-up: transcript-only workflow
+
+Removed thumbnail creation/routes, delivery-folder writes, Airtable updates, Google Sheets/CSV actions, database history writes/routes, and the integration debug endpoint from the running service. Batch completion now carries the VTT itself for browser download.
+
+Added full storyboard comparison (not the truncated ASR prompt), explicit unavailable/matched/review status, UI/header summaries, and detailed non-displaying VTT validation notes. Storyboard lookup is read-only; pasted dialogue supports single-video jobs. Runtime text-preservation validation supplements timing checks. Automated coverage increased to 24 tests, including absent/mismatching storyboards, full dialogue extraction, transcript-only processing, upload validation headers, removed routes, and database-free batch downloads. JavaScript syntax also checked. Storyboard integration has mocked connector coverage; a live authenticated Google Doc comparison was not run in this follow-up.

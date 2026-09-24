@@ -1,18 +1,13 @@
-import csv
-import io
 import json
 import logging
 import math
 import os
 import re
-import subprocess
 import tempfile
-from datetime import date
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import httpx
-import psycopg2
 from fastapi import FastAPI, File, Form, Request, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydub import AudioSegment
@@ -20,6 +15,8 @@ from pydub import AudioSegment
 from openai import OpenAI
 from captions import render as render_phrase_captions, tokens as caption_tokens
 from starlette.concurrency import run_in_threadpool
+from validation import extract_storyboard_dialogue, check_output, report_summary, attach_report
+import html
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,26 +40,6 @@ AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE_ID = "appf82sOr6qFvVj6z"
 AIRTABLE_TASKS_TABLE = "tblnMlOiI3q3Zj4jo"
 
-VIDEOS_UPLOAD_DIR = Path(os.path.expanduser(
-    os.environ.get("VIDEOS_UPLOAD_DIR", "~/Desktop/Videos for Upload")
-))
-THUMBNAIL_DIR = Path(tempfile.gettempdir()) / "vtt_thumbnails"
-
-GOOGLE_OAUTH_TOKEN = os.environ.get("GOOGLE_OAUTH_TOKEN", "")
-UPLOAD_SHEET_ID = "1OUQ0NyIaCOsPvYUCQhJ41roINv9fT9wrV4llHl74BpY"
-UPLOAD_SHEET_TAB = "Information for Video Uploading"
-
-# ---------------------------------------------------------------------------
-# Database helpers
-# ---------------------------------------------------------------------------
-
-def get_db():
-    url = os.environ.get("DATABASE_URL")
-    if not url:
-        return None
-    return psycopg2.connect(url)
-
-
 def require_openai_api_key() -> None:
     if not os.environ.get("OPENAI_API_KEY"):
         raise HTTPException(
@@ -71,82 +48,10 @@ def require_openai_api_key() -> None:
         )
 
 
-def init_db():
-    conn = get_db()
-    if conn is None:
-        return
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS transcriptions (
-                    id          SERIAL PRIMARY KEY,
-                    filename    TEXT NOT NULL,
-                    file_size   INTEGER NOT NULL,
-                    duration_s  REAL,
-                    vtt_content TEXT NOT NULL,
-                    created_at  TIMESTAMP DEFAULT NOW(),
-                    ip_address  TEXT
-                );
-            """)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def parse_vtt_duration(vtt_text: str) -> float | None:
-    matches = re.findall(r"(\d{2}):(\d{2}):(\d{2})\.(\d{3})", vtt_text)
-    if not matches:
-        return None
-    h, m, s, ms = matches[-1]
-    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
-
-
-def save_transcription(filename: str, file_size: int, vtt_content: str, ip: str | None) -> int | None:
-    conn = get_db()
-    if conn is None:
-        return None
-    try:
-        duration = parse_vtt_duration(vtt_content)
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO transcriptions (filename, file_size, duration_s, vtt_content, ip_address)
-                   VALUES (%s, %s, %s, %s, %s) RETURNING id""",
-                (filename, file_size, duration, vtt_content, ip),
-            )
-            row = cur.fetchone()
-        conn.commit()
-        return row[0] if row else None
-    finally:
-        conn.close()
-
-
-@app.on_event("startup")
-def startup():
-    init_db()
-
-
-# ---------------------------------------------------------------------------
-# Filename helpers
-# ---------------------------------------------------------------------------
-
 def extract_video_id(filename: str) -> int | None:
     """Parse leading Video ID from filenames like '121_What is a Community_Final.mp4'."""
-    m = re.match(r'^(\d+)[_\s]', Path(filename).stem)
+    m = re.match(r'^#?(\d+)[_\s]', Path(filename).stem)
     return int(m.group(1)) if m else None
-
-
-def save_to_upload_folder(filename: str, vtt_content: str) -> None:
-    """Write VTT to ~/Desktop/Videos for Upload if the folder exists."""
-    if VIDEOS_UPLOAD_DIR.is_dir():
-        out = VIDEOS_UPLOAD_DIR / (Path(filename).stem + ".vtt")
-        out.write_text(vtt_content, encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# Airtable / storyboard helpers
-# ---------------------------------------------------------------------------
-
-_VO_LINE_RE = re.compile(r'(?:Narrator|Dialogue)[^:]*:\s*[""]?(.+)', re.IGNORECASE)
 
 
 def fetch_airtable_record(video_id: int) -> tuple[str, str, str] | None:
@@ -192,279 +97,10 @@ def fetch_storyboard_vo(storyboard_url: str) -> str | None:
             )
             resp.raise_for_status()
             text = resp.text
-        vo_lines = []
-        for line in text.splitlines():
-            line = line.strip()
-            lm = _VO_LINE_RE.match(line)
-            if lm:
-                content = lm.group(1).strip().strip('"').strip('"').strip('"')
-                if content and not content.startswith("[") and len(content) > 3:
-                    vo_lines.append(content)
-        # Whisper's prompt window is ~224 tokens; 900 chars is a safe limit
-        return " ".join(vo_lines)[:900] if vo_lines else None
+        return extract_storyboard_dialogue(text)
     except Exception:
         return None
 
-
-def generate_thumbnail(file_path: str, stem: str) -> bool:
-    """Extract a frame at ~10 s and save a 552x414 PNG. Returns True if saved."""
-    out_dir = VIDEOS_UPLOAD_DIR if VIDEOS_UPLOAD_DIR.is_dir() else THUMBNAIL_DIR
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{stem}.png"
-    if out_path.exists():
-        return True
-    try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-ss", "10",
-                "-i", file_path,
-                "-vframes", "1",
-                "-vf", "scale=552:414:force_original_aspect_ratio=increase,crop=552:414",
-                "-q:v", "2",
-                str(out_path),
-            ],
-            capture_output=True,
-            check=True,
-        )
-        logger.info("generate_thumbnail: saved %s", out_path)
-        return True
-    except Exception as exc:
-        logger.error("generate_thumbnail failed: %s", exc)
-        return False
-
-
-def get_thumbnail_path(stem: str) -> Path | None:
-    for d in [VIDEOS_UPLOAD_DIR, THUMBNAIL_DIR]:
-        p = d / f"{stem}.png"
-        if p.exists():
-            return p
-    return None
-
-
-def update_upload_date(record_id: str) -> None:
-    """Set Video Assets Uploaded to today's date on the Airtable record."""
-    if not AIRTABLE_TOKEN or not record_id:
-        return
-    try:
-        with httpx.Client(timeout=15) as client:
-            client.patch(
-                f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TASKS_TABLE}/{record_id}",
-                json={"fields": {"Video Assets Uploaded": date.today().isoformat()}},
-                headers={
-                    "Authorization": f"Bearer {AIRTABLE_TOKEN}",
-                    "Content-Type": "application/json",
-                },
-            )
-    except Exception:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Master sheet / upload CSV helpers
-# ---------------------------------------------------------------------------
-
-_MASTER_SHEET_CSV_URL = (
-    "https://docs.google.com/spreadsheets/d/"
-    "1h8eckJjQIHForqxywqqEhNJ_3FdE2_fZe66NIUjR5yA"
-    "/export?format=csv&gid=1118701471"
-)
-
-_MASTER_SHEET_COLS = [
-    "Video ID #",
-    "Category",
-    "Topic (Video Name)",
-    "Grade Level",
-    "Standard",
-    "Key Vocab",
-    "Learning Objective",
-    "Topic Question 1 - Freeze Question",
-    "Topic Question 2 - Reflection Ending Question",
-    "Conversation Starter 1",
-    "Conversation Starter 2",
-]
-
-_UPLOAD_CSV_COLS = [
-    "Video ID #",
-    "Sponsor",
-    "Category",
-    "Collection",
-    "Topic (Video Name)",
-    "Video Available for Demo Mode",
-    "Grade Level",
-    "Standard",
-    "Key Vocab",
-    "Learning Objective",
-    "Topic Question 1 - Freeze Question",
-    "Topic Question 2 - Reflection Ending Question",
-    "Conversation Starter 1",
-    "Conversation Starter 2",
-]
-
-_SEL_QUESTION_FIELDS = [
-    "Topic Question 1 - Freeze Question",
-    "Topic Question 2 - Reflection Ending Question",
-    "Conversation Starter 1",
-    "Conversation Starter 2",
-]
-
-_SEL_WORDS_RE = re.compile(
-    r"\b(brave|bravery|courageous|courage|heroic|unfair|injustice|"
-    r"amazing|incredible|wonderful|inspiring|inspire|hopeful|hope|"
-    r"determined|determination|resilient|resilience|proud|joyful|"
-    r"dignity|agency|empowerment|empower)\b",
-    re.IGNORECASE,
-)
-
-_SEL_PHRASES_RE = re.compile(
-    r"how do you think (?:he|she|they|[a-z]+) felt"
-    r"|how did it feel to"
-    r"|imagine how (?:hard|scary|exciting)"
-    r"|what do you feel when"
-    r"|how do you feel about"
-    r"|what would it feel like"
-    r"|how (?:do you think you'?d?|would you) feel"
-    r"|what (?:made|makes) \w+ (?:brave|strong|courageous|determined)"
-    r"|how did \w+ show"
-    r"|what qualities made"
-    r"|what would you do if"
-    r"|if you were .+, how would you feel"
-    r"|why is (?:sharing|kindness|fairness|helping) important"
-    r"|what does this teach us about",
-    re.IGNORECASE,
-)
-
-
-def _has_sel_violation(text: str) -> bool:
-    return bool(_SEL_WORDS_RE.search(text) or _SEL_PHRASES_RE.search(text))
-
-
-def fetch_master_sheet_row(video_id: int) -> dict | None:
-    """Fetch the master Google Sheet CSV and return the row matching video_id."""
-    try:
-        with httpx.Client(follow_redirects=True, timeout=30) as client:
-            resp = client.get(_MASTER_SHEET_CSV_URL)
-            resp.raise_for_status()
-        reader = csv.DictReader(io.StringIO(resp.text))
-        for row in reader:
-            raw_id = row.get("Video ID #", "").strip()
-            try:
-                if int(raw_id) == video_id:
-                    logger.info("fetch_master_sheet_row: found Video ID %s", video_id)
-                    return {col: row.get(col, "").strip() for col in _MASTER_SHEET_COLS}
-            except (ValueError, TypeError):
-                continue
-    except Exception as exc:
-        logger.error("fetch_master_sheet_row failed: %s", exc)
-    logger.warning("fetch_master_sheet_row: no row found for Video ID %s", video_id)
-    return None
-
-
-def sel_check_and_rewrite(row: dict) -> dict:
-    """Check question fields for SEL violations and auto-rewrite via OpenAI."""
-    row = dict(row)
-    violations = [f for f in _SEL_QUESTION_FIELDS if _has_sel_violation(row.get(f, ""))]
-    if not violations:
-        return row
-
-    client = OpenAI()
-    topic = row.get("Topic (Video Name)", "this video")
-    objective = row.get("Learning Objective", "")
-    vocab = row.get("Key Vocab", "")
-
-    for field in violations:
-        original = row[field]
-        is_freeze = "Freeze Question" in field
-        rewrite_instruction = (
-            "Rewrite as a factual comprehension question anchored to episode content. "
-            "Use What/Who/When/Where/How framing. No emotion, no speculation, no moralizing. "
-            "Return only the rewritten question, nothing else."
-            if is_freeze else
-            "Rewrite to anchor in facts or concrete actions instead of feelings or traits. "
-            "Keep the subject matter. Return only the rewritten question, nothing else."
-        )
-        prompt = (
-            f"You are editing a question for an educational video titled '{topic}'.\n"
-            f"Learning objective: {objective}\n"
-            f"Key vocab: {vocab}\n\n"
-            f"The question below violates SEL (Social-Emotional Learning) guidelines "
-            f"because it uses feelings-speculation, character-trait framing, moralizing, "
-            f"or forbidden SEL words (brave, courage, inspiring, hope, etc.).\n\n"
-            f"Original question: {original}\n\n"
-            f"{rewrite_instruction}"
-        )
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=150,
-                temperature=0.3,
-            )
-            rewritten = response.choices[0].message.content.strip()
-            if rewritten:
-                row[field] = rewritten
-        except Exception:
-            pass
-
-    return row
-
-
-def _write_upload_csv_fallback(row: dict) -> None:
-    """Fallback: append row to a local CSV when the Sheets webhook is unavailable."""
-    if not VIDEOS_UPLOAD_DIR.is_dir():
-        return
-    csv_path = VIDEOS_UPLOAD_DIR / f"video-upload-rows-{date.today().isoformat()}.csv"
-    file_exists = csv_path.exists()
-    try:
-        with open(csv_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=_UPLOAD_CSV_COLS, extrasaction="ignore")
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow({col: row.get(col, "") for col in _UPLOAD_CSV_COLS})
-    except Exception:
-        pass
-
-
-def write_to_upload_sheet(row: dict) -> None:
-    """Append the row to the Google Sheet via OAuth2; falls back to local CSV."""
-    import gspread
-    from google.oauth2.credentials import Credentials
-    from google.auth.transport.requests import Request
-
-    values = [row.get(col, "") for col in _UPLOAD_CSV_COLS]
-    if not GOOGLE_OAUTH_TOKEN:
-        logger.warning("write_to_upload_sheet: GOOGLE_OAUTH_TOKEN not set, falling back to CSV")
-        _write_upload_csv_fallback(row)
-        return
-    try:
-        # Env var can be raw JSON (Railway) or a file path (local).
-        # Strip control characters that get introduced when pasting into Railway.
-        if GOOGLE_OAUTH_TOKEN.strip().startswith("{"):
-            clean = re.sub(r"[\x00-\x1f\x7f]", "", GOOGLE_OAUTH_TOKEN)
-            info = json.loads(clean)
-            creds = Credentials.from_authorized_user_info(
-                info,
-                scopes=["https://www.googleapis.com/auth/spreadsheets"],
-            )
-        else:
-            creds = Credentials.from_authorized_user_file(
-                GOOGLE_OAUTH_TOKEN,
-                scopes=["https://www.googleapis.com/auth/spreadsheets"],
-            )
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        gc = gspread.authorize(creds)
-        ws = gc.open_by_key(UPLOAD_SHEET_ID).worksheet(UPLOAD_SHEET_TAB)
-        ws.append_row(values, value_input_option="USER_ENTERED")
-        logger.info("write_to_upload_sheet: appended row for Video ID %s", row.get("Video ID #"))
-    except Exception as exc:
-        logger.error("write_to_upload_sheet failed: %s", exc, exc_info=True)
-        _write_upload_csv_fallback(row)
-
-
-# ---------------------------------------------------------------------------
-# Transcription helpers
-# ---------------------------------------------------------------------------
 
 def fmt_ts(seconds: float) -> str:
     h = int(seconds // 3600)
@@ -492,7 +128,7 @@ def transcribe_chunk(client: OpenAI, chunk_path: str, prompt: str | None = None)
             timestamp_granularities=["word", "segment"],
         )
         if prompt:
-            kwargs["prompt"] = prompt
+            kwargs["prompt"] = prompt[:900]
         return client.audio.transcriptions.create(**kwargs)
 
 
@@ -659,7 +295,7 @@ def parse_vtt_cues(vtt_text: str) -> list[tuple[float, float, str]]:
     blocks = re.split(r"\n\s*\n", vtt_text.strip())
     for block in blocks:
         lines = [line.strip() for line in block.splitlines() if line.strip()]
-        if not lines or lines[0] == "WEBVTT" or lines[0].startswith("Kind:") or lines[0].startswith("Language:"):
+        if not lines or lines[0].startswith("NOTE") or lines[0] == "WEBVTT" or lines[0].startswith("Kind:") or lines[0].startswith("Language:"):
             continue
 
         time_index = None
@@ -831,6 +467,10 @@ def transcribe_file(file_path: str, vo_prompt: str | None = None) -> str:
             for label, candidate_segments in [("cleaned", spellchecked_segments), ("raw", raw_segments)]:
                 vtt_text = build_caption_vtt(candidate_segments, raw_words, audio_duration_s)
                 valid_vtt, vtt_message = validate_vtt_output(vtt_text, audio_duration_s)
+                rendered_text = " ".join(html.unescape(t) for _, _, t in parse_vtt_cues(vtt_text))
+                recognized_text = " ".join(seg["text"] for seg in raw_segments)
+                if caption_tokens(rendered_text) != caption_tokens(recognized_text):
+                    raise ValueError("Caption rendering changed recognized words.")
                 if valid_vtt:
                     logger.info("transcribe_file: attempt %s accepted %s phrase VTT", attempt, label)
                     return vtt_text
@@ -897,37 +537,19 @@ def download_url_to_temp(url: str) -> tuple[str, str, int]:
     return tmp.name, filename, size
 
 
-def process_media_file(
-    file_path: str,
-    filename: str,
-    file_size: int,
-    ip: str | None,
-) -> dict:
-    stem = Path(filename).stem
-    video_id = extract_video_id(filename)
-    airtable = fetch_airtable_record(video_id) if video_id is not None else None
-    record_id, topic, storyboard_url = airtable if airtable else (None, stem, "")
-    vo_prompt = fetch_storyboard_vo(storyboard_url)
-
-    vtt_text = transcribe_file(file_path, vo_prompt=vo_prompt)
-
-    transcription_id = save_transcription(filename, file_size, vtt_text, ip)
-    save_to_upload_folder(filename, vtt_text)
-    generate_thumbnail(file_path, stem)
-    update_upload_date(record_id)
-
-    master_row = fetch_master_sheet_row(video_id) if video_id is not None else None
-    if master_row:
-        master_row = sel_check_and_rewrite(master_row)
-        write_to_upload_sheet(master_row)
-
-    return {
-        "filename": filename,
-        "stem": stem,
-        "vtt_text": vtt_text,
-        "transcription_id": transcription_id,
-        "thumbnail_url": f"/thumbnail/{stem}" if get_thumbnail_path(stem) else None,
-    }
+def process_media_file(file_path: str, filename: str, file_size: int = 0,
+                       ip: str | None = None, storyboard_text: str | None = None) -> dict:
+    """Generate one VTT. External integrations are read-only storyboard lookups."""
+    if storyboard_text and storyboard_text.strip():
+        storyboard_text = extract_storyboard_dialogue(storyboard_text) or storyboard_text.strip()
+    else:
+        video_id = extract_video_id(filename)
+        record = fetch_airtable_record(video_id) if video_id is not None else None
+        storyboard_text = fetch_storyboard_vo(record[2]) if record else None
+    vtt_text = transcribe_file(file_path, vo_prompt=storyboard_text)
+    report = check_output(parse_vtt_cues(vtt_text), storyboard_text)
+    return {"filename": Path(filename).stem + ".vtt",
+            "vtt_text": attach_report(vtt_text, report), "validation": report_summary(report)}
 
 
 # ---------------------------------------------------------------------------
@@ -981,7 +603,7 @@ HTML_PAGE = """
   .batch-hint { color: #777; font-size: 0.8rem; margin-bottom: 0.75rem; }
   .batch-item { padding: 0.5rem 0; border-bottom: 1px solid #222; display: flex; justify-content: space-between; align-items: center; }
   .batch-item .name { color: #ccc; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 0.5rem; }
-  .batch-item .state { font-size: 0.8rem; white-space: nowrap; }
+  .batch-item .state { font-size: 0.8rem; white-space: normal; max-width: 65%; }
   .batch-item .state.queued { color: #666; }
   .batch-item .state.downloading { color: #f0ad4e; }
   .batch-item .state.transcribing { color: #f0ad4e; }
@@ -998,6 +620,9 @@ HTML_PAGE = """
 <div class="container">
   <h1>VTT Generator</h1>
   <p class="sub">Generate cleaner subtitle files (.vtt) with steadier cue timing</p>
+
+  <label for="storyboard">Storyboard dialogue for a single video (optional; batches look up each video ID)</label>
+  <textarea id="storyboard" placeholder="Paste spoken dialogue from the storyboard"></textarea>
 
   <div class="tabs">
     <div class="tab active" data-tab="file">File Upload</div>
@@ -1053,7 +678,7 @@ HTML_PAGE = """
     <div class="batch-log" id="batch-log"></div>
   </div>
 
-  <div class="nav"><a href="/history">View transcription history</a></div>
+
 </div>
 <script>
   // --- Tabs ---
@@ -1102,15 +727,15 @@ HTML_PAGE = """
     try {
       const fd = new FormData();
       fd.append('file', file);
+      fd.append('storyboard_text', document.getElementById('storyboard').value);
       const res = await fetch('/transcribe', { method: 'POST', body: fd });
       if (!res.ok) { const err = await res.json(); throw new Error(err.detail || 'Transcription failed'); }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const name = file.name.replace(/\\.[^.]+$/, '') + '.vtt';
-      const thumbUrl = res.headers.get('X-Thumbnail-URL');
       fileStatus.className = 'status success';
-      fileStatus.innerHTML = '<a href="' + url + '" download="' + name + '">Download ' + name + '</a>'
-        + (thumbUrl ? ' &nbsp; <a href="' + thumbUrl + '" download>Download thumbnail</a>' : '');
+      fileStatus.innerHTML = '<a href="' + url + '" download="' + name + '">Download ' + name + '</a>';
+      fileStatus.append(document.createTextNode(' — ' + (res.headers.get('X-Validation-Summary') || '')));
     } catch (err) {
       fileStatus.className = 'status error';
       fileStatus.textContent = err.message;
@@ -1131,7 +756,7 @@ HTML_PAGE = """
     urlStatus.className = 'status';
     urlStatus.textContent = 'Downloading and transcribing…';
     try {
-      const body = 'url=' + encodeURIComponent(url);
+      const body = 'url=' + encodeURIComponent(url) + '&storyboard_text=' + encodeURIComponent(document.getElementById('storyboard').value);
       const res = await fetch('/transcribe-url', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -1143,10 +768,9 @@ HTML_PAGE = """
       const match = disp.match(/filename="(.+?)"/);
       const name = match ? match[1] : 'subtitles.vtt';
       const blobUrl = URL.createObjectURL(blob);
-      const thumbUrl2 = res.headers.get('X-Thumbnail-URL');
       urlStatus.className = 'status success';
-      urlStatus.innerHTML = '<a href="' + blobUrl + '" download="' + name + '">Download ' + name + '</a>'
-        + (thumbUrl2 ? ' &nbsp; <a href="' + thumbUrl2 + '" download>Download thumbnail</a>' : '');
+      urlStatus.innerHTML = '<a href="' + blobUrl + '" download="' + name + '">Download ' + name + '</a>';
+      urlStatus.append(document.createTextNode(' — ' + (res.headers.get('X-Validation-Summary') || '')));
     } catch (err) {
       urlStatus.className = 'status error';
       urlStatus.textContent = err.message;
@@ -1236,10 +860,9 @@ HTML_PAGE = """
         const blob = await res.blob();
         const blobUrl = URL.createObjectURL(blob);
         const name = file.name.replace(/\\.[^.]+$/, '') + '.vtt';
-        const thumbUrl = res.headers.get('X-Thumbnail-URL');
-        const links = '<a href="' + blobUrl + '" download="' + name + '">download VTT</a>'
-          + (thumbUrl ? ' <a href="' + thumbUrl + '" download>thumbnail</a>' : '');
+        const links = '<a href="' + blobUrl + '" download="' + name + '">download VTT</a>';
         updateBatchState(i, 'done', 'done ' + links);
+        document.getElementById('bs-' + i)?.append(document.createTextNode(res.headers.get('X-Validation-Summary') || ''));
       } catch (err) {
         updateBatchState(i, 'error', (err && err.message) ? err.message : 'error');
       }
@@ -1274,8 +897,10 @@ HTML_PAGE = """
       } else if (d.status === 'transcribing') {
         updateBatchState(d.index, 'transcribing', 'transcribing…');
       } else if (d.status === 'done') {
-        const link = d.id ? 'done <a href="/download/' + d.id + '">download</a>' : 'done';
+        const blobUrl = URL.createObjectURL(new Blob([d.vtt_text], {type: 'text/vtt'}));
+        const link = 'done <a href="' + blobUrl + '" download="subtitles.vtt">download VTT</a>';
         updateBatchState(d.index, 'done', link);
+        document.getElementById('bs-' + d.index)?.append(document.createTextNode(d.validation || ''));
       } else if (d.status === 'error') {
         updateBatchState(d.index, 'error', d.message || 'error');
       } else if (d.status === 'complete') {
@@ -1291,50 +916,13 @@ HTML_PAGE = """
 </html>
 """
 
-HISTORY_PAGE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Transcription History</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: system-ui, sans-serif; background: #0f0f0f; color: #e0e0e0; display: flex; justify-content: center; padding: 2rem; }
-  .container { background: #1a1a1a; border-radius: 12px; padding: 2.5rem; max-width: 720px; width: 100%; box-shadow: 0 4px 24px rgba(0,0,0,0.4); }
-  h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
-  .nav { margin-bottom: 1.5rem; }
-  .nav a { color: #4a9eff; font-size: 0.85rem; text-decoration: none; }
-  .nav a:hover { text-decoration: underline; }
-  table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
-  th, td { text-align: left; padding: 0.6rem 0.75rem; border-bottom: 1px solid #2a2a2a; font-size: 0.9rem; }
-  th { color: #888; font-weight: 600; }
-  td a { color: #4a9eff; text-decoration: none; }
-  td a:hover { text-decoration: underline; }
-  .empty { color: #666; margin-top: 1.5rem; text-align: center; }
-</style>
-</head>
-<body>
-<div class="container">
-  <div class="nav"><a href="/">&larr; Back to generator</a></div>
-  <h1>Transcription History</h1>
-  {{TABLE}}
-</div>
-</body>
-</html>
-"""
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTML_PAGE
 
 
 @app.post("/transcribe")
-async def transcribe(request: Request, file: UploadFile = File(...)):
+async def transcribe(request: Request, file: UploadFile = File(...), storyboard_text: str = Form("")):
     require_openai_api_key()
     contents = await file.read()
     if len(contents) > MAX_UPLOAD_SIZE:
@@ -1347,19 +935,18 @@ async def transcribe(request: Request, file: UploadFile = File(...)):
         tmp.write(contents)
         tmp.close()
         ip = request.client.host if request.client else None
-        result = await run_in_threadpool(process_media_file, tmp.name, original_name, len(contents), ip)
+        result = await run_in_threadpool(process_media_file, tmp.name, original_name, len(contents), ip, storyboard_text)
 
         out_name = Path(original_name).stem + ".vtt"
         resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
-        if result["thumbnail_url"]:
-            resp_headers["X-Thumbnail-URL"] = result["thumbnail_url"]
+        resp_headers["X-Validation-Summary"] = result.get("validation", "")
         return Response(content=result["vtt_text"], media_type="text/vtt", headers=resp_headers)
     finally:
         os.unlink(tmp.name)
 
 
 @app.post("/transcribe-url")
-async def transcribe_url(request: Request, url: str = Form(...)):
+async def transcribe_url(request: Request, url: str = Form(...), storyboard_text: str = Form("")):
     require_openai_api_key()
     try:
         file_path, filename, file_size = await run_in_threadpool(download_url_to_temp, url)
@@ -1370,12 +957,11 @@ async def transcribe_url(request: Request, url: str = Form(...)):
 
     try:
         ip = request.client.host if request.client else None
-        result = await run_in_threadpool(process_media_file, file_path, filename, file_size, ip)
+        result = await run_in_threadpool(process_media_file, file_path, filename, file_size, ip, storyboard_text)
 
         out_name = Path(filename).stem + ".vtt"
         resp_headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
-        if result["thumbnail_url"]:
-            resp_headers["X-Thumbnail-URL"] = result["thumbnail_url"]
+        resp_headers["X-Validation-Summary"] = result.get("validation", "")
         return Response(content=result["vtt_text"], media_type="text/vtt", headers=resp_headers)
     finally:
         os.unlink(file_path)
@@ -1410,7 +996,7 @@ async def batch(request: Request, urls: str):
             try:
                 yield f"data: {json.dumps({'index': i, 'status': 'transcribing'})}\n\n"
                 result = process_media_file(file_path, filename, file_size, ip)
-                yield f"data: {json.dumps({'index': i, 'status': 'done', 'id': result['transcription_id']})}\n\n"
+                yield f"data: {json.dumps({'index': i, 'status': 'done', **result})}\n\n"
             except Exception as exc:
                 yield f"data: {json.dumps({'index': i, 'status': 'error', 'message': f'Transcription failed: {exc}'})}\n\n"
             finally:
@@ -1422,142 +1008,3 @@ async def batch(request: Request, urls: str):
         yield f"data: {json.dumps({'status': 'complete'})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-
-@app.get("/history", response_class=HTMLResponse)
-async def history():
-    conn = get_db()
-    if conn is None:
-        return HISTORY_PAGE.replace("{{TABLE}}", '<p class="empty">Database not configured.</p>')
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, filename, file_size, duration_s, created_at FROM transcriptions ORDER BY created_at DESC LIMIT 100"
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    if not rows:
-        return HISTORY_PAGE.replace("{{TABLE}}", '<p class="empty">No transcriptions yet.</p>')
-
-    table_rows = ""
-    for row in rows:
-        tid, fname, fsize, dur, created = row
-        size_mb = f"{fsize / 1024 / 1024:.1f} MB"
-        duration = f"{dur:.0f}s" if dur else "—"
-        date = created.strftime("%Y-%m-%d %H:%M") if created else "—"
-        table_rows += (
-            f"<tr>"
-            f"<td>{fname}</td>"
-            f"<td>{size_mb}</td>"
-            f"<td>{duration}</td>"
-            f"<td>{date}</td>"
-            f'<td><a href="/download/{tid}">Download</a></td>'
-            f"</tr>\n"
-        )
-
-    table_html = (
-        "<table><thead><tr>"
-        "<th>Filename</th><th>Size</th><th>Duration</th><th>Date</th><th></th>"
-        "</tr></thead><tbody>\n"
-        + table_rows
-        + "</tbody></table>"
-    )
-    return HISTORY_PAGE.replace("{{TABLE}}", table_html)
-
-
-@app.get("/download/{transcription_id}")
-async def download(transcription_id: int):
-    conn = get_db()
-    if conn is None:
-        raise HTTPException(status_code=503, detail="Database not configured.")
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT filename, vtt_content FROM transcriptions WHERE id = %s",
-                (transcription_id,),
-            )
-            row = cur.fetchone()
-    finally:
-        conn.close()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Transcription not found.")
-
-    fname, vtt = row
-    out_name = Path(fname).stem + ".vtt"
-    return Response(
-        content=vtt,
-        media_type="text/vtt",
-        headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
-    )
-
-
-@app.get("/thumbnail/{stem}")
-async def thumbnail(stem: str):
-    path = get_thumbnail_path(stem)
-    if not path:
-        raise HTTPException(status_code=404, detail="Thumbnail not found.")
-    return Response(
-        content=path.read_bytes(),
-        media_type="image/png",
-        headers={"Content-Disposition": f'attachment; filename="{stem}.png"'},
-    )
-
-
-@app.get("/debug")
-async def debug():
-    status = {}
-
-    # Env vars
-    status["GOOGLE_OAUTH_TOKEN_set"] = bool(GOOGLE_OAUTH_TOKEN)
-    status["AIRTABLE_TOKEN_set"] = bool(AIRTABLE_TOKEN)
-    status["VIDEOS_UPLOAD_DIR"] = str(VIDEOS_UPLOAD_DIR)
-    status["VIDEOS_UPLOAD_DIR_exists"] = VIDEOS_UPLOAD_DIR.is_dir()
-
-    # ffmpeg
-    try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=5)
-        status["ffmpeg"] = "ok"
-    except Exception as exc:
-        status["ffmpeg"] = f"error: {exc}"
-
-    # Google Sheets connection
-    if GOOGLE_OAUTH_TOKEN:
-        try:
-            import gspread
-            from google.oauth2.credentials import Credentials
-            from google.auth.transport.requests import Request as GRequest
-            if GOOGLE_OAUTH_TOKEN.strip().startswith("{"):
-                info = json.loads(re.sub(r"[\x00-\x1f\x7f]", "", GOOGLE_OAUTH_TOKEN))
-                creds = Credentials.from_authorized_user_info(
-                    info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-                )
-            else:
-                creds = Credentials.from_authorized_user_file(
-                    GOOGLE_OAUTH_TOKEN, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-                )
-            if creds.expired and creds.refresh_token:
-                creds.refresh(GRequest())
-            gc = gspread.authorize(creds)
-            ws = gc.open_by_key(UPLOAD_SHEET_ID).worksheet(UPLOAD_SHEET_TAB)
-            status["sheets"] = f"ok — connected to '{ws.title}'"
-        except Exception as exc:
-            status["sheets"] = f"error: {exc}"
-    else:
-        status["sheets"] = "skipped — GOOGLE_OAUTH_TOKEN not set"
-
-    # Master sheet reachable
-    try:
-        with httpx.Client(follow_redirects=True, timeout=10) as client:
-            resp = client.get(_MASTER_SHEET_CSV_URL)
-            resp.raise_for_status()
-            row_count = len(resp.text.splitlines())
-        status["master_sheet"] = f"ok — {row_count} rows"
-    except Exception as exc:
-        status["master_sheet"] = f"error: {exc}"
-
-    return status

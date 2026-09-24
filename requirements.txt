@@ -2,9 +2,5 @@ fastapi
 uvicorn[standard]
 python-multipart
 openai
-psycopg2-binary
 pydub
 httpx
-gspread
-google-auth
-google-auth-oauthlib

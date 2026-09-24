@@ -121,7 +121,7 @@ class CaptionsTest(unittest.TestCase):
         from fastapi.testclient import TestClient
         words,segs=speech('These are stable captions for the video.')
         vtt=main.build_caption_vtt(segs,words,4)
-        with patch.object(main,'require_openai_api_key'), patch.object(main,'process_media_file',return_value={'vtt_text':vtt,'thumbnail_url':None}) as process:
+        with patch.object(main,'require_openai_api_key'), patch.object(main,'process_media_file',return_value={'vtt_text':vtt,'validation':'Timing passed.'}) as process:
             response=TestClient(main.app).post('/transcribe',files={'file':('example.mp4',b'test media','video/mp4')})
         self.assertEqual(response.status_code,200)
         self.assertEqual(response.text,vtt)
